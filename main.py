@@ -19,7 +19,7 @@ ADMIN_ID = 5542927340
 TRON_ADDRESS = "TJ4xrwKzKjk6FgKfuuqwah3Az5Ur22kJb"
 BANK_CARD = "6037 9975 9717 2684"
 
-RENDER_BASE_URL = os.getenv("RENDER_BASE_URL") or "https://teaz.onrender.com"
+RENDER_BASE_URL = os.getenv("RENDER_BASE_URL") or "https://teazvpn.onrender.com"
 WEBHOOK_PATH = f"/webhook/{TOKEN}"
 WEBHOOK_URL = f"{RENDER_BASE_URL}{WEBHOOK_PATH}"
 
