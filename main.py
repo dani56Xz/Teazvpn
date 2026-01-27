@@ -33,6 +33,10 @@ logging.basicConfig(
 )
 
 app = FastAPI()
+@app.on_event("startup")
+async def startup():
+    await application.initialize()
+    await application.start()
 
 # ---------- endpoint سلامت برای UptimeRobot ----------
 @app.get("/")
