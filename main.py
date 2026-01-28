@@ -4,7 +4,7 @@ import asyncio
 import random
 import string
 from datetime import datetime, timedelta
-from fastapi import FastAPI, Request, BackgroundTasks
+from fastapi import FastAPI, Request
 from telegram import (
     Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton, BotCommand
 )
@@ -23,9 +23,10 @@ RENDER_BASE_URL = os.getenv("RENDER_BASE_URL") or "https://teazvpn.onrender.com"
 WEBHOOK_PATH = f"/webhook/{TOKEN}"
 WEBHOOK_URL = f"{RENDER_BASE_URL}{WEBHOOK_PATH}"
 
-# ADDED: Cleanup settings
+# ADDED: Cleanup settings - بهبود یافته
 CLEANUP_INTERVAL_MINUTES = 15  # Automatic cleanup every 15 minutes
-MAX_USER_STATES_ENTRIES = 1000  # Maximum entries in user_states dict
+MAX_USER_STATES_ENTRIES = 500  # کاهش از 1000 به 500
+MAX_STATE_AGE_HOURS = 1  # حذف state‌های قدیمی‌تر از 1 ساعت
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -35,8 +36,90 @@ logging.basicConfig(
         logging.FileHandler("bot.log", encoding="utf-8")
     ]
 )
+# کاهش لاگ‌های غیرضروری
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("telegram").setLevel(logging.WARNING)
 
 app = FastAPI()
+
+# ADDED: Memory tracking
+import psutil
+import gc
+
+class MemoryManager:
+    """مدیریت حافظه برای ربات"""
+    
+    def __init__(self):
+        self.user_states = {}
+        self.state_timestamps = {}
+        self.last_cleanup = datetime.now()
+    
+    def add_state(self, user_id, state):
+        """افزایش state با timestamp"""
+        self.user_states[user_id] = state
+        self.state_timestamps[user_id] = datetime.now()
+    
+    def get_state(self, user_id):
+        """دریافت state با بررسی زمان"""
+        if user_id in self.user_states:
+            self.state_timestamps[user_id] = datetime.now()  # به‌روزرسانی زمان
+            return self.user_states.get(user_id)
+        return None
+    
+    def remove_state(self, user_id):
+        """حذف state"""
+        self.user_states.pop(user_id, None)
+        self.state_timestamps.pop(user_id, None)
+    
+    def cleanup_old_states(self):
+        """پاکسازی state‌های قدیمی"""
+        if not self.user_states:
+            return 0
+        
+        current_time = datetime.now()
+        keys_to_remove = []
+        
+        for user_id, timestamp in self.state_timestamps.items():
+            if (current_time - timestamp).total_seconds() > MAX_STATE_AGE_HOURS * 3600:
+                keys_to_remove.append(user_id)
+        
+        for key in keys_to_remove:
+            self.remove_state(key)
+        
+        # اگر هنوز تعداد state‌ها زیاد است، قدیمی‌ترین‌ها را حذف کن
+        if len(self.user_states) > MAX_USER_STATES_ENTRIES:
+            sorted_keys = sorted(
+                self.state_timestamps.keys(),
+                key=lambda x: self.state_timestamps[x]
+            )
+            keys_to_remove = sorted_keys[:len(sorted_keys) - MAX_USER_STATES_ENTRIES // 2]
+            for key in keys_to_remove:
+                self.remove_state(key)
+        
+        self.last_cleanup = current_time
+        return len(keys_to_remove)
+    
+    def get_stats(self):
+        """گزارش وضعیت"""
+        return {
+            "total_states": len(self.user_states),
+            "oldest_state": min(self.state_timestamps.values()) if self.state_timestamps else None,
+            "last_cleanup": self.last_cleanup,
+            "memory_usage": self.get_memory_usage()
+        }
+    
+    def get_memory_usage(self):
+        """مصرف حافظه"""
+        process = psutil.Process()
+        memory_info = process.memory_info()
+        return {
+            "rss_mb": memory_info.rss / 1024 / 1024,
+            "vms_mb": memory_info.vms / 1024 / 1024,
+            "percent": process.memory_percent()
+        }
+
+# ایجاد مدیر حافظه
+memory_manager = MemoryManager()
 
 # ADDED: Background cleanup task reference
 cleanup_task = None
@@ -59,7 +142,8 @@ def init_db_pool():
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL environment variable is not set.")
     try:
-        db_pool = psycopg2.pool.ThreadedConnectionPool(minconn=1, maxconn=10, dsn=DATABASE_URL)
+        # کاهش connections برای صرفه‌جویی در حافظه
+        db_pool = psycopg2.pool.ThreadedConnectionPool(minconn=1, maxconn=5, dsn=DATABASE_URL)
         logging.info("Database pool initialized successfully")
     except Exception as e:
         logging.error(f"Failed to initialize database pool: {e}")
@@ -77,7 +161,6 @@ def _db_execute_sync(query, params=(), fetch=False, fetchone=False, returning=Fa
     cur = None
     try:
         conn = db_pool.getconn()
-        # ADDED: Track connection
         conn_id = id(conn)
         active_connections.add(conn_id)
         
@@ -97,7 +180,6 @@ def _db_execute_sync(query, params=(), fetch=False, fetchone=False, returning=Fa
         logging.error(f"Database error in query '{query}' with params {params}: {e}")
         raise
     finally:
-        # ADDED: Always ensure cleanup
         if cur:
             try:
                 cur.close()
@@ -105,7 +187,6 @@ def _db_execute_sync(query, params=(), fetch=False, fetchone=False, returning=Fa
                 pass
         if conn:
             try:
-                # ADDED: Remove from tracking before returning
                 conn_id = id(conn)
                 if conn_id in active_connections:
                     active_connections.remove(conn_id)
@@ -170,12 +251,10 @@ CREATE TABLE IF NOT EXISTS coupons (
 MIGRATE_SUBSCRIPTIONS_SQL = """
 DO $$
 BEGIN
-    -- اضافه کردن ستون is_new_user اگر وجود ندارد
     IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='is_new_user') THEN
         ALTER TABLE users ADD COLUMN is_new_user BOOLEAN DEFAULT TRUE;
     END IF;
     
-    -- به‌روزرسانی کاربران موجود
     UPDATE users SET is_new_user = FALSE WHERE is_new_user IS NULL;
 END $$;
 
@@ -215,15 +294,12 @@ async def create_tables():
 
 # ---------- دستور جدید برای حذف کاربر ----------
 async def remove_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    حذف کامل کاربر از دیتابیس (فقط برای ادمین)
-    """
     if update.effective_user.id != ADMIN_ID:
         await update.message.reply_text("⚠️ شما اجازه دسترسی به این دستور را ندارید.")
         return
     
     await update.message.reply_text("🆔 ایدی عددی کاربری که می‌خواهید حذف کنید را وارد کنید:")
-    user_states[update.effective_user.id] = "awaiting_user_id_for_removal"
+    memory_manager.add_state(update.effective_user.id, "awaiting_user_id_for_removal")
 
 # ---------- دستور جدید برای بکاپ گیری از دیتابیس ----------
 async def backup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -234,11 +310,9 @@ async def backup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await update.message.reply_text("🔄 در حال تهیه بکاپ از دیتابیس...")
         
-        # ایجاد فایل موقت برای بکاپ
         with tempfile.NamedTemporaryFile(suffix='.sql', delete=False) as tmp_file:
             backup_file = tmp_file.name
         
-        # استخراج اطلاعات اتصال از DATABASE_URL
         import urllib.parse
         parsed_url = urllib.parse.urlparse(DATABASE_URL)
         db_name = parsed_url.path[1:]
@@ -247,7 +321,6 @@ async def backup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db_host = parsed_url.hostname
         db_port = parsed_url.port or 5432
         
-        # اجرای دستور pg_dump برای بکاپ
         cmd = [
             'pg_dump',
             '-h', db_host,
@@ -255,14 +328,13 @@ async def backup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             '-U', db_user,
             '-d', db_name,
             '-f', backup_file,
-            '-F', 'p'  # فرمت plain text
+            '-F', 'p',
+            '--no-comments'  # کاهش حجم فایل
         ]
         
-        # تنظیم محیط برای پسورد
         env = os.environ.copy()
         env['PGPASSWORD'] = db_password
         
-        # اجرای دستور
         process = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         stdout, stderr = process.communicate()
         
@@ -270,7 +342,6 @@ async def backup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             error_msg = stderr.decode('utf-8') if stderr else "Unknown error"
             raise Exception(f"Backup failed: {error_msg}")
         
-        # ارسال فایل بکاپ
         with open(backup_file, 'rb') as file:
             await context.bot.send_document(
                 chat_id=ADMIN_ID,
@@ -279,22 +350,15 @@ async def backup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 caption="✅ بکاپ از دیتابیس با موفقیت تهیه شد."
             )
         
-        # حذف فایل موقت
         os.unlink(backup_file)
-        
         await update.message.reply_text("✅ بکاپ با موفقیت تهیه و ارسال شد.")
         
     except Exception as e:
         logging.error(f"Error in backup command: {e}")
         await update.message.reply_text(f"⚠️ خطا در تهیه بکاپ: {str(e)}")
 
-# ---------- تابع برای بازیابی دیتابیس از فایل بکاپ ----------
 async def restore_database_from_backup(file_path: str):
-    """
-    بازیابی دیتابیس از فایل بکاپ
-    """
     try:
-        # استخراج اطلاعات اتصال از DATABASE_URL
         import urllib.parse
         parsed_url = urllib.parse.urlparse(DATABASE_URL)
         db_name = parsed_url.path[1:]
@@ -303,7 +367,6 @@ async def restore_database_from_backup(file_path: str):
         db_host = parsed_url.hostname
         db_port = parsed_url.port or 5432
         
-        # اجرای دستور psql برای بازیابی
         cmd = [
             'psql',
             '-h', db_host,
@@ -313,11 +376,9 @@ async def restore_database_from_backup(file_path: str):
             '-f', file_path
         ]
         
-        # تنظیم محیط برای پسورد
         env = os.environ.copy()
         env['PGPASSWORD'] = db_password
         
-        # اجرای دستور
         process = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         stdout, stderr = process.communicate()
         
@@ -331,59 +392,54 @@ async def restore_database_from_backup(file_path: str):
         logging.error(f"Error restoring database: {e}")
         return False, f"⚠️ خطا در بازیابی دیتابیس: {str(e)}"
 
-# ---------- دستور جدید برای بازیابی دیتابیس ----------
 async def restore_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         await update.message.reply_text("⚠️ شما اجازه دسترسی به این دستور را ندارید.")
         return
     
     await update.message.reply_text("📤 لطفا فایل بکاپ دیتابیس را ارسال کنید:")
-    user_states[update.effective_user.id] = "awaiting_backup_file"
+    memory_manager.add_state(update.effective_user.id, "awaiting_backup_file")
 
-# ---------- تابع بهبود یافته برای ارسال اطلاعیه ----------
 async def send_notification_to_users(context, user_ids, notification_text):
-    """
-    تابع بهبود یافته برای ارسال موازی اطلاعیه به کاربران
-    """
     sent_count = 0
     failed_count = 0
     failed_users = []
     
-    # ارسال موازی پیام‌ها
-    tasks = []
-    for user_id in user_ids:
-        task = context.bot.send_message(
-            chat_id=user_id[0],
-            text=f"📢 اطلاعیه از مدیریت:\n\n{notification_text}"
-        )
-        tasks.append(task)
-    
-    # اجرای همه وظایف به صورت موازی
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-    
-    # بررسی نتایج
-    for i, result in enumerate(results):
-        user_id = user_ids[i][0]
-        if isinstance(result, Exception):
-            failed_count += 1
-            failed_users.append(user_id)
-            logging.error(f"Error sending notification to user_id {user_id}: {result}")
-        else:
-            sent_count += 1
+    # ارسال دسته‌ای برای کاهش مصرف حافظه
+    batch_size = 50
+    for i in range(0, len(user_ids), batch_size):
+        batch = user_ids[i:i + batch_size]
+        tasks = []
+        for user_id in batch:
+            task = context.bot.send_message(
+                chat_id=user_id[0],
+                text=f"📢 اطلاعیه از مدیریت:\n\n{notification_text}"
+            )
+            tasks.append(task)
+        
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        for j, result in enumerate(results):
+            user_id = batch[j][0]
+            if isinstance(result, Exception):
+                failed_count += 1
+                failed_users.append(user_id)
+            else:
+                sent_count += 1
+        
+        # آزادسازی حافظه
+        del tasks
+        del batch
+        await asyncio.sleep(0.1)  # توقف کوتاه برای کاهش فشار
     
     return sent_count, failed_count, failed_users
 
-# ---------- تابع برای اطلاع‌رسانی کاربر جدید به ادمین ----------
 async def notify_admin_new_user(user_id, username, invited_by=None):
-    """
-    ارسال پیام به ادمین هنگام ثبت‌نام کاربر جدید
-    """
     try:
         current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         username_display = f"@{username}" if username else "بدون یوزرنیم"
         invited_by_text = f"با دعوت کاربر {invited_by}" if invited_by and invited_by != user_id else "مستقیم"
         
-        # گرفتن تعداد کل کاربران
         total_users = await db_execute("SELECT COUNT(*) FROM users", fetchone=True)
         total_users_count = total_users[0] if total_users else 0
         
@@ -401,17 +457,14 @@ async def notify_admin_new_user(user_id, username, invited_by=None):
             text=message,
             parse_mode="Markdown"
         )
-        logging.info(f"Admin notified about new user: {user_id} (@{username})")
     except Exception as e:
         logging.error(f"Error notifying admin about new user {user_id}: {e}")
 
-# ---------- دستور جدید برای اطلاع رسانی ----------
 async def notification_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         await update.message.reply_text("⚠️ شما اجازه دسترسی به این دستور را ندارید.")
         return
     
-    # نمایش گزینه‌های اطلاع‌رسانی
     keyboard = [
         [KeyboardButton("📢 پیام به همه کاربران")],
         [KeyboardButton("🧑‍💼 پیام به نمایندگان")],
@@ -422,18 +475,16 @@ async def notification_command(update: Update, context: ContextTypes.DEFAULT_TYP
         "📢 نوع اطلاع‌رسانی را انتخاب کنید:",
         reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
     )
-    user_states[update.effective_user.id] = "awaiting_notification_type"
+    memory_manager.add_state(update.effective_user.id, "awaiting_notification_type")
 
-# ---------- دستور جدید برای مدیریت کد تخفیف ----------
 async def coupon_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         await update.message.reply_text("⚠️ شما اجازه دسترسی به این دستور را ندارید.")
         return
     
     await update.message.reply_text("💵 مقدار تخفیف را به درصد وارد کنید (مثال: 20):")
-    user_states[update.effective_user.id] = "awaiting_coupon_discount"
+    memory_manager.add_state(update.effective_user.id, "awaiting_coupon_discount")
 
-# ---------- دستور جدید برای اطلاعات کاربران ----------
 async def user_info_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         await update.message.reply_text("⚠️ شما اجازه دسترسی به این دستور را ندارید.")
@@ -448,7 +499,6 @@ async def user_info_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("📂 هیچ کاربری یافت نشد.")
             return
 
-        # کیبورد اینلاین برای گزینه‌ها
         inline_kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("💰 افزایش/کاهش موجودی", callback_data="admin_balance_action")],
             [InlineKeyboardButton("🧑‍💼 تغییر نوع اکانت", callback_data="admin_agent_action")],
@@ -463,7 +513,6 @@ async def user_info_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for user in users:
             user_id, username, phone, balance, is_agent, created_at, is_new_user = user
             
-            # تعداد کاربرانی که توسط این کاربر دعوت شده‌اند
             invited_count = await db_execute(
                 "SELECT COUNT(*) FROM users WHERE invited_by = %s",
                 (user_id,), fetchone=True
@@ -511,7 +560,6 @@ async def user_info_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logging.error(f"Error in user_info_command: {e}")
         await update.message.reply_text("⚠️ خطایی در نمایش اطلاعات کاربران رخ داد. لطفاً دوباره تلاش کنید.")
 
-# ---------- دستور آمار ربات ----------
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         await update.message.reply_text("⚠️ شما اجازه دسترسی به این دستور را ندارید.")
@@ -585,6 +633,9 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             fetchone=True
         )
         
+        # اضافه کردن آمار حافظه
+        memory_stats = memory_manager.get_stats()
+        
         stats_message = "🌟 گزارش عملکرد تیز VPN 🚀\n\n"
         stats_message += "👥 کاربران:\n"
         stats_message += f"  • کل کاربران: {total_users[0] if total_users else 0:,} نفر 🧑‍💻\n"
@@ -609,7 +660,13 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for method, percent in payment_methods_percent:
             display_name = method_names.get(method, method)
             stats_message += f"  • {display_name}: {percent}% 💸\n"
-        stats_message += f"  • کل تراکنش‌ها: {total_transactions[0] if total_transactions else 0:,} عدد 🔄\n"
+        stats_message += f"  • کل تراکنش‌ها: {total_transactions[0] if total_transactions else 0:,} عدد 🔄\n\n"
+        
+        stats_message += "💾 وضعیت حافظه:\n"
+        stats_message += f"  • state‌های فعال: {memory_stats['total_states']} عدد 🧹\n"
+        stats_message += f"  • مصرف RAM: {memory_stats['memory_usage']['rss_mb']:.2f} MB 📊\n"
+        stats_message += f"  • درصد استفاده: {memory_stats['memory_usage']['percent']:.1f}% ⚡\n"
+        stats_message += f"  • آخرین پاکسازی: {memory_stats['last_cleanup'].strftime('%H:%M')} 🕒"
         
         await update.message.reply_text(stats_message)
         
@@ -617,7 +674,6 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logging.error(f"Error generating stats: {e}")
         await update.message.reply_text("⚠️ خطایی در نمایش آمار رخ داد. لطفاً دوباره تلاش کنید.")
 
-# ---------- پاک کردن دیتابیس ----------
 async def clear_db(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         await update.message.reply_text("⚠️ شما اجازه دسترسی به این دستور را ندارید.")
@@ -633,7 +689,7 @@ async def clear_db(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logging.error(f"Error clearing database: {e}")
         await update.message.reply_text(f"⚠️ خطا در پاک کردن دیتابیس: {str(e)}")
 
-# ---------- ADDED: دستور پاکسازی حافظه ----------
+# ---------- ADDED: دستور پاکسازی حافظه بهبود یافته ----------
 async def cleanup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     پاکسازی دستی حافظه و نشتی‌های سیستم (فقط برای ادمین)
@@ -645,92 +701,126 @@ async def cleanup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await update.message.reply_text("🧹 در حال پاکسازی حافظه و نشتی‌ها...")
         
-        # پاکسازی user_states قدیمی
-        before_cleanup = len(user_states)
-        current_time = datetime.now()
+        # 1. پاکسازی user_states قدیمی
+        removed_states = memory_manager.cleanup_old_states()
         
-        # حذف رکوردهای قدیمی‌تر از 24 ساعت
-        keys_to_remove = []
-        for key in list(user_states.keys()):
-            # اگر state خیلی قدیمی است (24 ساعت)
-            if key in user_states and isinstance(user_states[key], str):
-                if user_states[key].startswith("awaiting_"):
-                    # این یک state موقت است، می‌تواند حذف شود
-                    keys_to_remove.append(key)
+        # 2. پاکسازی connections نشتی
+        db_connections_before = len(active_connections)
         
-        for key in keys_to_remove:
-            if key in user_states:
-                del user_states[key]
+        # 3. پاکسازی context.user_data قدیمی
+        old_contexts = 0
+        for user_data in context.application.user_data.values():
+            if user_data:
+                # حذف داده‌های قدیمی‌تر از 1 ساعت
+                current_time = datetime.now()
+                keys_to_remove = []
+                for key, value in user_data.items():
+                    if isinstance(value, datetime) and (current_time - value).total_seconds() > 3600:
+                        keys_to_remove.append(key)
+                
+                for key in keys_to_remove:
+                    del user_data[key]
+                    old_contexts += 1
         
-        after_cleanup = len(user_states)
+        # 4. جمع‌آوری زباله‌های Python
+        collected = gc.collect()
         
-        # گزارش وضعیت connections
-        db_connections = len(active_connections)
+        # 5. آزادسازی حافظه کش
+        import sys
+        if hasattr(sys, 'getallocatedblocks'):
+            gc.collect()
+            before_blocks = sys.getallocatedblocks()
+            gc.collect()
+            after_blocks = sys.getallocatedblocks()
+            blocks_freed = before_blocks - after_blocks
+        else:
+            blocks_freed = 0
         
-        # پاکسازی cache و جمع‌آوری زباله
-        import gc
-        gc.collect()
+        # 6. پاکسازی کانفیگ‌های قدیمی از حافظه
+        if hasattr(context, 'bot_data'):
+            old_keys = []
+            for key in list(context.bot_data.keys()):
+                if isinstance(key, str) and key.startswith('temp_'):
+                    if (datetime.now() - context.bot_data.get(f'{key}_time', datetime.now())).total_seconds() > 3600:
+                        old_keys.append(key)
+            
+            for key in old_keys:
+                context.bot_data.pop(key, None)
+                context.bot_data.pop(f'{key}_time', None)
+        
+        # 7. بررسی و آزادسازی connections اضافی
+        if db_pool:
+            try:
+                for _ in range(min(5, len(active_connections))):
+                    conn = db_pool.getconn()
+                    db_pool.putconn(conn)
+            except:
+                pass
+        
+        # گزارش وضعیت
+        memory_stats = memory_manager.get_stats()
         
         report = (
             f"✅ پاکسازی حافظه انجام شد:\n\n"
             f"🧹 user_states:\n"
-            f"   قبل: {before_cleanup}\n"
-            f"   بعد: {after_cleanup}\n"
-            f"   حذف شده: {before_cleanup - after_cleanup}\n\n"
-            f"🔗 connections فعال: {db_connections}\n\n"
-            f"💾 حافظه آزاد شده"
+            f"   حذف شده: {removed_states} state\n"
+            f"   باقی مانده: {memory_stats['total_states']}\n\n"
+            f"🔗 connections فعال:\n"
+            f"   قبل: {db_connections_before}\n"
+            f"   بعد: {len(active_connections)}\n\n"
+            f"📦 context قدیمی:\n"
+            f"   حذف شده: {old_contexts} کلید\n\n"
+            f"🗑️ زباله‌گردانی:\n"
+            f"   جمع‌آوری شده: {collected} شی\n"
+            f"   بلوک آزاد: {blocks_freed}\n\n"
+            f"💾 وضعیت حافظه:\n"
+            f"   مصرف RAM: {memory_stats['memory_usage']['rss_mb']:.2f} MB\n"
+            f"   درصد: {memory_stats['memory_usage']['percent']:.1f}%\n\n"
+            f"📈 بهینه‌سازی حافظه موفقیت‌آمیز بود!"
         )
         
         await update.message.reply_text(report, reply_markup=get_main_keyboard())
-        logging.info(f"Cleanup completed: user_states {before_cleanup} -> {after_cleanup}, active connections: {db_connections}")
+        logging.info(f"Cleanup completed: {removed_states} states removed, {collected} objects collected")
         
     except Exception as e:
         logging.error(f"Error in cleanup_command: {e}")
         await update.message.reply_text(f"⚠️ خطا در پاکسازی: {str(e)}", reply_markup=get_main_keyboard())
 
-# ---------- ADDED: تابع پاکسازی خودکار ----------
+# ---------- ADDED: تابع پاکسازی خودکار بهبود یافته ----------
 async def auto_cleanup_task():
     """
     پاکسازی خودکار هر 15 دقیقه برای جلوگیری از نشتی حافظه
     """
     while True:
         try:
-            await asyncio.sleep(CLEANUP_INTERVAL_MINUTES * 60)  # هر 15 دقیقه
+            await asyncio.sleep(CLEANUP_INTERVAL_MINUTES * 60)
             
             current_time = datetime.now()
             logging.info(f"🔄 شروع پاکسازی خودکار در {current_time}")
             
-            # پاکسازی user_states اگر خیلی بزرگ شده
-            if len(user_states) > MAX_USER_STATES_ENTRIES:
-                old_size = len(user_states)
-                # فقط نیمی از قدیمی‌ترین‌ها را نگه دار
-                keys = list(user_states.keys())
-                if len(keys) > MAX_USER_STATES_ENTRIES // 2:
-                    keys_to_remove = keys[:len(keys) - MAX_USER_STATES_ENTRIES // 2]
-                    for key in keys_to_remove:
-                        if key in user_states:
-                            del user_states[key]
-                    logging.info(f"🧹 user_states cleaned: {old_size} -> {len(user_states)}")
+            # 1. پاکسازی state‌های قدیمی
+            removed_states = memory_manager.cleanup_old_states()
             
-            # پاکسازی connections نشتی
-            if len(active_connections) > 20:  # اگر بیش از 20 connection فعال داریم
-                logging.warning(f"⚠️ تعداد connections فعال زیاد است: {len(active_connections)}")
-                # تلاش برای رها کردن connections قدیمی
-                import gc
-                gc.collect()
+            # 2. جمع‌آوری زباله
+            collected = gc.collect()
             
-            # لاگ وضعیت حافظه
-            import psutil
-            process = psutil.Process()
-            memory_info = process.memory_info()
-            logging.info(f"💾 وضعیت حافظه: RSS={memory_info.rss / 1024 / 1024:.2f}MB, VMS={memory_info.vms / 1024 / 1024:.2f}MB")
+            # 3. لاگ وضعیت حافظه
+            memory_stats = memory_manager.get_stats()
+            
+            # فقط اگر حافظه بالاست لاگ بزن
+            if memory_stats['memory_usage']['rss_mb'] > 100:  # اگر بیش از 100MB مصرف دارد
+                logging.info(
+                    f"🧹 پاکسازی خودکار: {removed_states} state حذف شد, "
+                    f"{collected} شی جمع‌آوری شد, "
+                    f"RAM: {memory_stats['memory_usage']['rss_mb']:.2f}MB"
+                )
             
         except asyncio.CancelledError:
             logging.info("🛑 پاکسازی خودکار متوقف شد")
             break
         except Exception as e:
             logging.error(f"⚠️ خطا در پاکسازی خودکار: {e}")
-            await asyncio.sleep(60)  # در صورت خطا 1 دقیقه صبر کن
+            await asyncio.sleep(60)
 
 # ---------- کیبوردها ----------
 def get_main_keyboard():
@@ -839,7 +929,7 @@ async def create_coupon(code, discount_percent, user_id=None):
             "INSERT INTO coupons (code, discount_percent, user_id, is_used) VALUES (%s, %s, %s, FALSE)",
             (code, discount_percent, user_id)
         )
-        logging.info(f"Coupon {code} created with {discount_percent}% discount for user_id {user_id or 'all'}")
+        logging.info(f"Coupon {code} created with {discount_percent}% discount")
     except Exception as e:
         logging.error(f"Error creating coupon {code}: {e}")
         raise
@@ -873,24 +963,12 @@ async def mark_coupon_used(code):
     except Exception as e:
         logging.error(f"Error marking coupon {code} as used: {e}")
 
-# ---------- تابع برای حذف کامل کاربر از دیتابیس ----------
 async def remove_user_from_db(user_id):
-    """
-    حذف کامل کاربر از تمام جداول دیتابیس
-    """
     try:
-        # حذف از کوپن‌ها
         await db_execute("DELETE FROM coupons WHERE user_id = %s", (user_id,))
-        
-        # حذف از اشتراک‌ها
         await db_execute("DELETE FROM subscriptions WHERE user_id = %s", (user_id,))
-        
-        # حذف از پرداخت‌ها
         await db_execute("DELETE FROM payments WHERE user_id = %s", (user_id,))
-        
-        # حذف از کاربران
         await db_execute("DELETE FROM users WHERE user_id = %s", (user_id,))
-        
         logging.info(f"User {user_id} completely removed from database")
         return True
     except Exception as e:
@@ -907,35 +985,26 @@ async def is_user_member(user_id):
         return False
 
 async def ensure_user(user_id, username, invited_by=None):
-    """
-    تابع اصلاح شده برای ثبت کاربر در دیتابیس با اطلاع‌رسانی به ادمین
-    """
     try:
-        # بررسی آیا کاربر قبلاً ثبت‌نام کرده است
         row = await db_execute("SELECT user_id FROM users WHERE user_id = %s", (user_id,), fetchone=True)
         
         if not row:
-            # کاربر جدید - ثبت در دیتابیس
             await db_execute(
                 "INSERT INTO users (user_id, username, invited_by, is_agent, is_new_user) VALUES (%s, %s, %s, FALSE, TRUE)",
                 (user_id, username, invited_by)
             )
             
-            # اطلاع به ادمین (برای کاربران جدید)
             await notify_admin_new_user(user_id, username, invited_by)
             
-            # اعتبار برای دعوت‌کننده
             if invited_by and invited_by != user_id:
                 inviter = await db_execute("SELECT user_id FROM users WHERE user_id = %s", (invited_by,), fetchone=True)
                 if inviter:
-                    await add_balance(invited_by, 10000)  # تغییر از 25000 به 10000
-                    
+                    await add_balance(invited_by, 10000)
+            
             logging.info(f"NEW user {user_id} registered in database")
             
-        elif row:  # کاربر وجود دارد
-            # فقط برای کاربران موجود، برچسب new_user را غیرفعال کن
+        elif row:
             await db_execute("UPDATE users SET is_new_user = FALSE WHERE user_id = %s", (user_id,))
-            logging.info(f"Existing user {user_id} marked as non-new")
             
     except Exception as e:
         logging.error(f"Error ensuring user {user_id}: {e}")
@@ -1137,9 +1206,6 @@ async def debug_subscriptions(update: Update, context: ContextTypes.DEFAULT_TYPE
         logging.error(f"Error in debug_subscriptions: {e}")
         await update.message.reply_text(f"⚠️ خطا در بررسی اشتراک‌ها: {str(e)}")
 
-# ---------- وضعیت کاربر در مموری ----------
-user_states = {}
-
 def generate_coupon_code(length=8):
     return ''.join(random.choices(string.ascii_uppercase + string.digits, k=length))
 
@@ -1160,7 +1226,7 @@ async def set_bot_commands():
             BotCommand(command="/backup", description="تهیه بکاپ از دیتابیس (ادمین)"),
             BotCommand(command="/restore", description="بازیابی دیتابیس از بکاپ (ادمین)"),
             BotCommand(command="/remove_user", description="حذف کاربر از دیتابیس (ادمین)"),
-            BotCommand(command="/cleanup", description="پاکسازی حافظه (ادمین)")  # ADDED
+            BotCommand(command="/cleanup", description="پاکسازی حافظه (ادمین)")
         ]
         await application.bot.set_my_commands(public_commands)
         await application.bot.set_my_commands(admin_commands, scope={"type": "chat", "chat_id": ADMIN_ID})
@@ -1173,7 +1239,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = user.id
     username = user.username or ""
 
-    # چک کردن عضویت در کانال
     if not await is_user_member(user_id):
         kb = [[InlineKeyboardButton("📢 عضویت در کانال", url=f"https://t.me/{CHANNEL_USERNAME.replace('@','')}")]]
         await update.message.reply_text(
@@ -1189,46 +1254,41 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🌐 به فروشگاه تیز VPN خوش آمدید!\n\nیک گزینه را انتخاب کنید:",
         reply_markup=get_main_keyboard()
     )
-    user_states.pop(user_id, None)
+    memory_manager.remove_state(user_id)
 
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     text = update.message.text if update.message.text else ""
     
-    # لاگ وضعیت فعلی کاربر
-    logging.info(f"User {user_id} sent: '{text}', current state: {user_states.get(user_id)}")
-    
     # پاک کردن وضعیت وقتی کاربر روی "بازگشت به منو" کلیک می‌کند
     if text in ["بازگشت به منو", "⬅️ بازگشت به منو"]:
         await update.message.reply_text("🌐 منوی اصلی:", reply_markup=get_main_keyboard())
-        user_states.pop(user_id, None)
+        memory_manager.remove_state(user_id)
         return
 
+    # دریافت وضعیت فعلی کاربر
+    state = memory_manager.get_state(user_id)
+    
     # هندلر جدید برای حذف کاربر
-    if user_states.get(user_id) == "awaiting_user_id_for_removal":
+    if state == "awaiting_user_id_for_removal":
         await handle_remove_user(update, context, user_id, text)
         return
 
     # هندلر جدید برای دریافت فایل بکاپ
-    if user_states.get(user_id) == "awaiting_backup_file":
+    if state == "awaiting_backup_file":
         if update.message.document:
             try:
-                # دریافت فایل
                 file = await context.bot.get_file(update.message.document.file_id)
                 
-                # ایجاد فایل موقت برای ذخیره بکاپ
                 with tempfile.NamedTemporaryFile(suffix='.sql', delete=False) as tmp_file:
                     backup_file = tmp_file.name
                 
-                # دانلود فایل
                 await file.download_to_drive(backup_file)
                 
                 await update.message.reply_text("🔄 در حال بازیابی دیتابیس...")
                 
-                # بازیابی دیتابیس
                 success, message = await restore_database_from_backup(backup_file)
                 
-                # حذف فایل موقت
                 os.unlink(backup_file)
                 
                 if success:
@@ -1236,45 +1296,42 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 else:
                     await update.message.reply_text(message, reply_markup=get_main_keyboard())
                 
-                user_states.pop(user_id, None)
+                memory_manager.remove_state(user_id)
                 return
                 
             except Exception as e:
                 logging.error(f"Error in restore process: {e}")
                 await update.message.reply_text(f"⚠️ خطا در بازیابی دیتابیس: {str(e)}", reply_markup=get_main_keyboard())
-                user_states.pop(user_id, None)
+                memory_manager.remove_state(user_id)
                 return
         else:
             await update.message.reply_text("⚠️ لطفا یک فایل بکاپ ارسال کنید.", reply_markup=get_back_keyboard())
             return
 
-    # بررسی وضعیت‌های خاص کاربر
-    state = user_states.get(user_id)
-    
     # پردازش وضعیت‌های مربوط به فیش پرداخت
     if state and state.startswith("awaiting_deposit_receipt_"):
         payment_id = int(state.split("_")[-1])
         await process_payment_receipt(update, context, user_id, payment_id, "deposit")
-        user_states.pop(user_id, None)
+        memory_manager.remove_state(user_id)
         return
         
     elif state and state.startswith("awaiting_subscription_receipt_"):
         payment_id = int(state.split("_")[-1])
         await process_payment_receipt(update, context, user_id, payment_id, "subscription")
-        user_states.pop(user_id, None)
+        memory_manager.remove_state(user_id)
         return
         
     elif state and state.startswith("awaiting_agency_receipt_"):
         payment_id = int(state.split("_")[-1])
         await process_payment_receipt(update, context, user_id, payment_id, "agency")
-        user_states.pop(user_id, None)
+        memory_manager.remove_state(user_id)
         return
 
     # پردازش کانفیگ توسط ادمین
     elif state and state.startswith("awaiting_config_"):
         payment_id = int(state.split("_")[-1])
         await process_config(update, context, user_id, payment_id)
-        user_states.pop(user_id, None)
+        memory_manager.remove_state(user_id)
         return
 
     # پردازش دستورات ادمین برای کوپن
@@ -1283,7 +1340,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             discount_percent = int(text)
             if 1 <= discount_percent <= 100:
                 coupon_code = generate_coupon_code()
-                user_states[user_id] = f"awaiting_coupon_recipient_{coupon_code}_{discount_percent}"
+                memory_manager.add_state(user_id, f"awaiting_coupon_recipient_{coupon_code}_{discount_percent}")
                 await update.message.reply_text(
                     f"💵 کد تخفیف `{coupon_code}` با {discount_percent}% تخفیف ایجاد شد.\nبرای چه کسانی ارسال شود؟",
                     reply_markup=get_coupon_recipient_keyboard(),
@@ -1346,22 +1403,20 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # اگر کاربر در هیچ وضعیت خاصی نباشد، دستورات معمولی را پردازش کن
     await handle_normal_commands(update, context, user_id, text)
 
+# ---------- توابع هندلر ----------
 async def handle_remove_user(update, context, user_id, text):
     """پردازش حذف کاربر"""
     try:
         target_user_id = int(text)
         
-        # بررسی اینکه کاربر وجود دارد یا نه
         user_exists = await db_execute("SELECT user_id, username FROM users WHERE user_id = %s", (target_user_id,), fetchone=True)
         if not user_exists:
             await update.message.reply_text("⚠️ کاربری با این ایدی یافت نشد.", reply_markup=get_main_keyboard())
-            user_states.pop(user_id, None)
+            memory_manager.remove_state(user_id)
             return
         
-        # تایید از ادمین
         username = user_exists[1] or "بدون یوزرنیم"
         
-        # ایجاد کیبورد تایید
         keyboard = ReplyKeyboardMarkup([
             [KeyboardButton(f"✅ بله، کاربر {target_user_id} را حذف کن")],
             [KeyboardButton("❌ خیر، انصراف")]
@@ -1376,7 +1431,7 @@ async def handle_remove_user(update, context, user_id, text):
         )
         
         context.user_data["pending_removal_user_id"] = target_user_id
-        user_states[user_id] = "confirm_user_removal"
+        memory_manager.add_state(user_id, "confirm_user_removal")
         
     except ValueError:
         await update.message.reply_text("⚠️ لطفا یک ایدی عددی معتبر وارد کنید.", reply_markup=get_back_keyboard())
@@ -1456,7 +1511,7 @@ async def handle_coupon_recipient(update, context, user_id, state, text):
                     "⚠️ هیچ کاربری (غیر از نمایندگان) یافت نشد.",
                     reply_markup=get_main_keyboard()
                 )
-                user_states.pop(user_id, None)
+                memory_manager.remove_state(user_id)
                 return
                 
             sent_count = 0
@@ -1477,7 +1532,7 @@ async def handle_coupon_recipient(update, context, user_id, state, text):
                 reply_markup=get_main_keyboard(),
                 parse_mode="Markdown"
             )
-            user_states.pop(user_id, None)
+            memory_manager.remove_state(user_id)
             
         except Exception as e:
             logging.error(f"Error sending coupons to all users: {e}")
@@ -1485,7 +1540,7 @@ async def handle_coupon_recipient(update, context, user_id, state, text):
                 "⚠️ خطا در ارسال کد تخفیف برای همه کاربران.",
                 reply_markup=get_main_keyboard()
             )
-            user_states.pop(user_id, None)
+            memory_manager.remove_state(user_id)
         return
         
     elif text == "👤 برای یک نفر":
@@ -1501,7 +1556,7 @@ async def handle_coupon_recipient(update, context, user_id, state, text):
                     "⚠️ این کاربر نماینده است و نمی‌تواند کد تخفیف دریافت کند.",
                     reply_markup=get_main_keyboard()
                 )
-                user_states.pop(user_id, None)
+                memory_manager.remove_state(user_id)
                 return
                 
             await create_coupon(coupon_code, discount_percent, target_user_id)
@@ -1515,17 +1570,17 @@ async def handle_coupon_recipient(update, context, user_id, state, text):
                 reply_markup=get_main_keyboard(),
                 parse_mode="Markdown"
             )
-            user_states.pop(user_id, None)
+            memory_manager.remove_state(user_id)
         else:
             await update.message.reply_text(
                 f"⚠️ کاربری با ID {target_user_id} یافت نشد.",
                 reply_markup=get_main_keyboard()
             )
-            user_states.pop(user_id, None)
+            memory_manager.remove_state(user_id)
         return
         
     elif text == "🎯 درصد خاصی از کاربران":
-        user_states[user_id] = f"awaiting_coupon_percent_{coupon_code}_{discount_percent}"
+        memory_manager.add_state(user_id, f"awaiting_coupon_percent_{coupon_code}_{discount_percent}")
         await update.message.reply_text("📊 درصد کاربران را وارد کنید (مثال: 20):", reply_markup=get_back_keyboard())
         return
         
@@ -1549,7 +1604,7 @@ async def handle_coupon_percent(update, context, user_id, state, text):
                         "⚠️ هیچ کاربری (غیر از نمایندگان) یافت نشد.",
                         reply_markup=get_main_keyboard()
                     )
-                    user_states.pop(user_id, None)
+                    memory_manager.remove_state(user_id)
                     return
                     
                 total_users = len(users)
@@ -1575,7 +1630,7 @@ async def handle_coupon_percent(update, context, user_id, state, text):
                     reply_markup=get_main_keyboard(),
                     parse_mode="Markdown"
                 )
-                user_states.pop(user_id, None)
+                memory_manager.remove_state(user_id)
                 
             except Exception as e:
                 logging.error(f"Error sending coupons to {percent}% of users: {e}")
@@ -1583,7 +1638,7 @@ async def handle_coupon_percent(update, context, user_id, state, text):
                     "⚠️ خطا در ارسال کد تخفیف برای درصد مشخصی از کاربران.",
                     reply_markup=get_main_keyboard()
                 )
-                user_states.pop(user_id, None)
+                memory_manager.remove_state(user_id)
         else:
             await update.message.reply_text("⚠️ درصد باید بین 1 تا 100 باشد.", reply_markup=get_back_keyboard())
     else:
@@ -1596,7 +1651,7 @@ async def handle_coupon_code(update, context, user_id, state, text):
     plan = "_".join(parts[4:]) if len(parts) <= 5 else "_".join(parts[4:-1])
     
     if text == "ادامه":
-        user_states[user_id] = f"awaiting_payment_method_{amount}_{plan}"
+        memory_manager.add_state(user_id, f"awaiting_payment_method_{amount}_{plan}")
         await update.message.reply_text("💳 روش خرید را انتخاب کنید:", reply_markup=get_payment_method_keyboard())
         return
         
@@ -1610,7 +1665,7 @@ async def handle_coupon_code(update, context, user_id, state, text):
         return
         
     discounted_amount = int(amount * (1 - discount_percent / 100))
-    user_states[user_id] = f"awaiting_payment_method_{discounted_amount}_{plan}_{coupon_code}"
+    memory_manager.add_state(user_id, f"awaiting_payment_method_{discounted_amount}_{plan}_{coupon_code}")
     await update.message.reply_text(
         f"✅ کد تخفیف اعمال شد! مبلغ با {discount_percent}% تخفیف: {discounted_amount} تومان\nروش خرید را انتخاب کنید:",
         reply_markup=get_payment_method_keyboard()
@@ -1619,17 +1674,17 @@ async def handle_coupon_code(update, context, user_id, state, text):
 async def handle_notification_type(update, context, user_id, text):
     """پردازش نوع اطلاع‌رسانی"""
     if text == "📢 پیام به همه کاربران":
-        user_states[user_id] = "awaiting_notification_text_all"
+        memory_manager.add_state(user_id, "awaiting_notification_text_all")
         await update.message.reply_text("📢 لطفا متن اطلاع‌رسانی را ارسال کنید:", reply_markup=get_back_keyboard())
     elif text == "🧑‍💼 پیام به نمایندگان":
-        user_states[user_id] = "awaiting_notification_text_agents"
+        memory_manager.add_state(user_id, "awaiting_notification_text_agents")
         await update.message.reply_text("🧑‍💼 لطفا متن اطلاع‌رسانی را ارسال کنید:", reply_markup=get_back_keyboard())
     elif text == "👤 پیام به یک نفر":
-        user_states[user_id] = "awaiting_notification_target_user"
+        memory_manager.add_state(user_id, "awaiting_notification_target_user")
         await update.message.reply_text("🆔 ایدی عددی کاربر را وارد کنید:", reply_markup=get_back_keyboard())
     elif text == "⬅️ بازگشت به منو":
         await update.message.reply_text("🌐 منوی اصلی:", reply_markup=get_main_keyboard())
-        user_states.pop(user_id, None)
+        memory_manager.remove_state(user_id)
 
 async def handle_notification_target_user(update, context, user_id, text):
     """پردازش ایدی کاربر برای اطلاع‌رسانی"""
@@ -1640,7 +1695,7 @@ async def handle_notification_target_user(update, context, user_id, text):
             await update.message.reply_text("⚠️ کاربر یافت نشد. لطفا ایدی معتبر وارد کنید:", reply_markup=get_back_keyboard())
             return
             
-        user_states[user_id] = f"awaiting_notification_text_single_{target_user_id}"
+        memory_manager.add_state(user_id, f"awaiting_notification_text_single_{target_user_id}")
         await update.message.reply_text("📢 لطفا متن اطلاع‌رسانی را ارسال کنید:", reply_markup=get_back_keyboard())
         
     except ValueError:
@@ -1680,7 +1735,7 @@ async def handle_notification_text(update, context, user_id, state, text):
             [KeyboardButton("❌ خیر، انصراف")]
         ], resize_keyboard=True)
     )
-    user_states[user_id] = f"confirm_notification_{notification_type}"
+    memory_manager.add_state(user_id, f"confirm_notification_{notification_type}")
 
 async def handle_confirm_notification(update, context, user_id, state, text):
     """پردازش تایید نهایی اطلاع‌رسانی"""
@@ -1694,7 +1749,7 @@ async def handle_confirm_notification(update, context, user_id, state, text):
         
         if not notification_text:
             await update.message.reply_text("⚠️ متن اطلاعیه یافت نشد.", reply_markup=get_main_keyboard())
-            user_states.pop(user_id, None)
+            memory_manager.remove_state(user_id)
             return
             
         await update.message.reply_text(f"🔄 در حال ارسال اطلاعیه به {user_type}...", reply_markup=None)
@@ -1709,11 +1764,11 @@ async def handle_confirm_notification(update, context, user_id, state, text):
                     users = [[int(target_user_id)]]
                 else:
                     await update.message.reply_text("⚠️ ایدی کاربر یافت نشد.", reply_markup=get_main_keyboard())
-                    user_states.pop(user_id, None)
+                    memory_manager.remove_state(user_id)
                     return
             else:
                 await update.message.reply_text("⚠️ نوع اطلاع‌رسانی نامعتبر است.", reply_markup=get_main_keyboard())
-                user_states.pop(user_id, None)
+                memory_manager.remove_state(user_id)
                 return
                 
             if not users:
@@ -1721,7 +1776,7 @@ async def handle_confirm_notification(update, context, user_id, state, text):
                     f"⚠️ هیچ کاربری ({user_type}) یافت نشد.",
                     reply_markup=get_main_keyboard()
                 )
-                user_states.pop(user_id, None)
+                memory_manager.remove_state(user_id)
                 return
                 
             sent_count, failed_count, failed_users = await send_notification_to_users(
@@ -1755,7 +1810,7 @@ async def handle_confirm_notification(update, context, user_id, state, text):
             reply_markup=get_main_keyboard()
         )
         
-    user_states.pop(user_id, None)
+    memory_manager.remove_state(user_id)
 
 async def handle_admin_balance_user(update, context, user_id, text):
     """پردازش ایدی کاربر برای تغییر موجودی"""
@@ -1766,7 +1821,7 @@ async def handle_admin_balance_user(update, context, user_id, text):
             await update.message.reply_text("⚠️ کاربر یافت نشد.", reply_markup=get_back_keyboard())
             return
             
-        user_states[user_id] = f"awaiting_balance_amount_{target_user_id}"
+        memory_manager.add_state(user_id, f"awaiting_balance_amount_{target_user_id}")
         await update.message.reply_text("💰 مبلغ را وارد کنید (مثبت برای افزایش، منفی برای کاهش):", reply_markup=get_back_keyboard())
         
     except ValueError:
@@ -1791,7 +1846,7 @@ async def handle_admin_balance_amount(update, context, user_id, state, text):
             else:
                 await update.message.reply_text(f"⚠️ موجودی کاربر {target_user_id} ({current_balance:,} تومان) کافی نیست.", reply_markup=get_main_keyboard())
                 
-        user_states.pop(user_id, None)
+        memory_manager.remove_state(user_id)
         
     except ValueError:
         await update.message.reply_text("⚠️ مبلغ نامعتبر است.", reply_markup=get_back_keyboard())
@@ -1810,7 +1865,7 @@ async def handle_admin_agent_user(update, context, user_id, text):
             
         current_status, _ = user_exists
         status_text = "نماینده" if current_status else "ساده"
-        user_states[user_id] = f"awaiting_agent_type_{target_user_id}"
+        memory_manager.add_state(user_id, f"awaiting_agent_type_{target_user_id}")
         
         await update.message.reply_text(
             f"🆔 کاربر {target_user_id} در حال حاضر {status_text} است.\n"
@@ -1846,7 +1901,7 @@ async def handle_admin_agent_type(update, context, user_id, state, text):
         ], resize_keyboard=True))
         return
         
-    user_states.pop(user_id, None)
+    memory_manager.remove_state(user_id)
 
 async def handle_normal_commands(update, context, user_id, text):
     """پردازش دستورات عادی ربات"""
@@ -1856,7 +1911,7 @@ async def handle_normal_commands(update, context, user_id, text):
         "💰 موجودی", "💳 خرید اشتراک", "🎁 اشتراک تست رایگان", "☎️ پشتیبانی",
         "💵 اعتبار رایگان", "📂 اشتراک‌های من", "💡 راهنمای اتصال", "🧑‍💼 درخواست نمایندگی"
     ]:
-        user_states.pop(user_id, None)
+        memory_manager.remove_state(user_id)
     
     if text == "💰 موجودی":
         await update.message.reply_text("💰 بخش موجودی:\nیک گزینه را انتخاب کنید:", reply_markup=get_balance_keyboard())
@@ -1869,10 +1924,11 @@ async def handle_normal_commands(update, context, user_id, text):
 
     if text == "افزایش موجودی":
         await update.message.reply_text("💳 لطفا مبلغ واریزی را به تومان وارد کنید (مثال: 90000):", reply_markup=get_back_keyboard())
-        user_states[user_id] = "awaiting_deposit_amount"
+        memory_manager.add_state(user_id, "awaiting_deposit_amount")
         return
 
-    if user_states.get(user_id) == "awaiting_deposit_amount":
+    state = memory_manager.get_state(user_id)
+    if state == "awaiting_deposit_amount":
         if text.isdigit():
             amount = int(text)
             payment_id = await add_payment(user_id, amount, "increase_balance", "card_to_card")
@@ -1884,10 +1940,10 @@ async def handle_normal_commands(update, context, user_id, text):
                     reply_markup=get_back_keyboard(),
                     parse_mode="MarkdownV2"
                 )
-                user_states[user_id] = f"awaiting_deposit_receipt_{payment_id}"
+                memory_manager.add_state(user_id, f"awaiting_deposit_receipt_{payment_id}")
             else:
                 await update.message.reply_text("⚠️ خطا در ثبت پرداخت. لطفا دوباره تلاش کنید.", reply_markup=get_main_keyboard())
-                user_states.pop(user_id, None)
+                memory_manager.remove_state(user_id)
         else:
             await update.message.reply_text("⚠️ لطفا عدد وارد کنید.", reply_markup=get_back_keyboard())
         return
@@ -1916,7 +1972,7 @@ async def handle_normal_commands(update, context, user_id, text):
         amount = mapping.get(text, 0)
         if amount == 0:
             await update.message.reply_text("⚠️ خطا در انتخاب پلن. لطفا دوباره تلاش کنید.", reply_markup=get_main_keyboard())
-            user_states.pop(user_id, None)
+            memory_manager.remove_state(user_id)
             return
             
         is_agent = await is_user_agent(user_id)
@@ -1925,13 +1981,14 @@ async def handle_normal_commands(update, context, user_id, text):
                 f"💵 اگر کد تخفیف دارید، وارد کنید. در غیر این صورت برای ادامه روی 'ادامه' کلیک کنید:",
                 reply_markup=ReplyKeyboardMarkup([[KeyboardButton("ادامه")], [KeyboardButton("⬅️ بازگشت به منو")]], resize_keyboard=True)
             )
-            user_states[user_id] = f"awaiting_coupon_code_{amount}_{text}"
+            memory_manager.add_state(user_id, f"awaiting_coupon_code_{amount}_{text}")
         else:
-            user_states[user_id] = f"awaiting_payment_method_{amount}_{text}"
+            memory_manager.add_state(user_id, f"awaiting_payment_method_{amount}_{text}")
             await update.message.reply_text("💳 روش خرید را انتخاب کنید:", reply_markup=get_payment_method_keyboard())
         return
 
-    if user_states.get(user_id, "").startswith("awaiting_payment_method_"):
+    state = memory_manager.get_state(user_id)
+    if state and state.startswith("awaiting_payment_method_"):
         await handle_payment_method(update, context, user_id, text)
         return
 
@@ -1991,20 +2048,21 @@ async def handle_normal_commands(update, context, user_id, text):
         await handle_agency_request(update, context, user_id)
         return
 
-    if user_states.get(user_id) == "awaiting_agency_payment_method":
+    state = memory_manager.get_state(user_id)
+    if state == "awaiting_agency_payment_method":
         await handle_agency_payment(update, context, user_id, text)
         return
 
     # پردازش تایید حذف کاربر
-    if user_states.get(user_id) == "confirm_user_removal":
+    state = memory_manager.get_state(user_id)
+    if state == "confirm_user_removal":
         if text.startswith("✅ بله، کاربر"):
             target_user_id = context.user_data.get("pending_removal_user_id")
             if not target_user_id:
                 await update.message.reply_text("⚠️ خطا در دریافت اطلاعات کاربر.", reply_markup=get_main_keyboard())
-                user_states.pop(user_id, None)
+                memory_manager.remove_state(user_id)
                 return
             
-            # حذف کاربر از دیتابیس
             success = await remove_user_from_db(target_user_id)
             if success:
                 await update.message.reply_text(
@@ -2023,16 +2081,15 @@ async def handle_normal_commands(update, context, user_id, text):
         elif text == "❌ خیر، انصراف":
             await update.message.reply_text("❌ عملیات حذف کاربر لغو شد.", reply_markup=get_main_keyboard())
             
-        user_states.pop(user_id, None)
+        memory_manager.remove_state(user_id)
         return
 
     await update.message.reply_text("⚠️ دستور نامعتبر است. لطفا از دکمه‌ها استفاده کنید.", reply_markup=get_main_keyboard())
-    user_states.pop(user_id, None)
+    memory_manager.remove_state(user_id)
 
 async def handle_payment_method(update, context, user_id, text):
     """پردازش روش پرداخت"""
-    state = user_states.get(user_id)
-    logging.info(f"Processing payment method for user_id {user_id}, state: {state}")
+    state = memory_manager.get_state(user_id)
     
     try:
         parts = state.split("_")
@@ -2050,11 +2107,11 @@ async def handle_payment_method(update, context, user_id, text):
                     reply_markup=get_back_keyboard(),
                     parse_mode="MarkdownV2"
                 )
-                user_states[user_id] = f"awaiting_subscription_receipt_{payment_id}"
+                memory_manager.add_state(user_id, f"awaiting_subscription_receipt_{payment_id}")
                 logging.info(f"Set state to awaiting_subscription_receipt_{payment_id} for user_id {user_id}")
             else:
                 await update.message.reply_text("⚠️ خطا در ثبت پرداخت. لطفا دوباره تلاش کنید.", reply_markup=get_main_keyboard())
-                user_states.pop(user_id, None)
+                memory_manager.remove_state(user_id)
             return
 
         if text == "💎 پرداخت با ترون":
@@ -2067,11 +2124,11 @@ async def handle_payment_method(update, context, user_id, text):
                     reply_markup=get_back_keyboard(),
                     parse_mode="MarkdownV2"
                 )
-                user_states[user_id] = f"awaiting_subscription_receipt_{payment_id}"
+                memory_manager.add_state(user_id, f"awaiting_subscription_receipt_{payment_id}")
                 logging.info(f"Set state to awaiting_subscription_receipt_{payment_id} for user_id {user_id}")
             else:
                 await update.message.reply_text("⚠️ خطا در ثبت پرداخت. لطفا دوباره تلاش کنید.", reply_markup=get_main_keyboard())
-                user_states.pop(user_id, None)
+                memory_manager.remove_state(user_id)
             return
 
         if text == "💰 پرداخت با موجودی":
@@ -2098,23 +2155,23 @@ async def handle_payment_method(update, context, user_id, text):
                         text=f"✅ پرداخت برای اشتراک ({plan}) تایید شد.",
                         reply_markup=config_keyboard
                     )
-                    user_states.pop(user_id, None)
+                    memory_manager.remove_state(user_id)
                     logging.info(f"Payment with balance successful for user_id {user_id}, payment_id: {payment_id}")
                 else:
                     await update.message.reply_text("⚠️ خطا در ثبت پرداخت. لطفا دوباره تلاش کنید.", reply_markup=get_main_keyboard())
-                    user_states.pop(user_id, None)
+                    memory_manager.remove_state(user_id)
             else:
                 await update.message.reply_text(
                     f"⚠️ موجودی شما ({balance} تومان) کافی نیست. لطفا ابتدا موجودی خود را افزایش دهید.",
                     reply_markup=get_main_keyboard()
                 )
-                user_states.pop(user_id, None)
+                memory_manager.remove_state(user_id)
             return
 
     except Exception as e:
         logging.error(f"Error processing payment method for user_id {user_id}, state: {state}, error: {e}")
         await update.message.reply_text("⚠️ خطا در پردازش. لطفا دوباره تلاش کنید.", reply_markup=get_main_keyboard())
-        user_states.pop(user_id, None)
+        memory_manager.remove_state(user_id)
         return
 
 async def show_user_subscriptions(update, context, user_id):
@@ -2180,7 +2237,7 @@ async def handle_agency_request(update, context, user_id):
         "🔻 در صورت تایید موارد بالا روش پرداخت خود را انتخاب کنید"
     )
     await update.message.reply_text(agency_text, reply_markup=get_payment_method_keyboard())
-    user_states[user_id] = "awaiting_agency_payment_method"
+    memory_manager.add_state(user_id, "awaiting_agency_payment_method")
 
 async def handle_agency_payment(update, context, user_id, text):
     """پردازش پرداخت نمایندگی"""
@@ -2196,10 +2253,10 @@ async def handle_agency_payment(update, context, user_id, text):
                 reply_markup=get_back_keyboard(),
                 parse_mode="MarkdownV2"
             )
-            user_states[user_id] = f"awaiting_agency_receipt_{payment_id}"
+            memory_manager.add_state(user_id, f"awaiting_agency_receipt_{payment_id}")
         else:
             await update.message.reply_text("⚠️ خطا در ثبت پرداخت. لطفا دوباره تلاش کنید.", reply_markup=get_main_keyboard())
-            user_states.pop(user_id, None)
+            memory_manager.remove_state(user_id)
         return
 
     if text == "💎 پرداخت با ترون":
@@ -2211,10 +2268,10 @@ async def handle_agency_payment(update, context, user_id, text):
                 reply_markup=get_back_keyboard(),
                 parse_mode="MarkdownV2"
             )
-            user_states[user_id] = f"awaiting_agency_receipt_{payment_id}"
+            memory_manager.add_state(user_id, f"awaiting_agency_receipt_{payment_id}")
         else:
             await update.message.reply_text("⚠️ خطا در ثبت پرداخت. لطفا دوباره تلاش کنید.", reply_markup=get_main_keyboard())
-            user_states.pop(user_id, None)
+            memory_manager.remove_state(user_id)
         return
 
     if text == "💰 پرداخت با موجودی":
@@ -2234,16 +2291,16 @@ async def handle_agency_payment(update, context, user_id, text):
                     chat_id=ADMIN_ID,
                     text=f"📢 کاربر {user_id} (@{update.effective_user.username or 'NoUsername'}) با موجودی خود نمایندگی خریداری کرد."
                 )
-                user_states.pop(user_id, None)
+                memory_manager.remove_state(user_id)
             else:
                 await update.message.reply_text("⚠️ خطا در ثبت پرداخت. لطفا دوباره تلاش کنید.", reply_markup=get_main_keyboard())
-                user_states.pop(user_id, None)
+                memory_manager.remove_state(user_id)
         else:
             await update.message.reply_text(
                 f"⚠️ موجودی شما ({balance} تومان) کافی نیست. لطفا ابتدا موجودی خود را افزایش دهید.",
                 reply_markup=get_main_keyboard()
             )
-            user_states.pop(user_id, None)
+            memory_manager.remove_state(user_id)
         return
 
 async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2303,19 +2360,19 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
             await query.message.reply_text("⚠️ پرداخت یافت نشد.")
             return
         await query.message.reply_text("لطفا کانفیگ را ارسال کنید.")
-        user_states[ADMIN_ID] = f"awaiting_config_{payment_id}"
+        memory_manager.add_state(ADMIN_ID, f"awaiting_config_{payment_id}")
     
     elif data == "admin_balance_action":
         await query.message.reply_text("🆔 ایدی عددی کاربر را وارد کنید:")
-        user_states[ADMIN_ID] = "awaiting_admin_user_id_for_balance"
+        memory_manager.add_state(ADMIN_ID, "awaiting_admin_user_id_for_balance")
     
     elif data == "admin_agent_action":
         await query.message.reply_text("🆔 ایدی عددی کاربر را وارد کنید:")
-        user_states[ADMIN_ID] = "awaiting_admin_user_id_for_agent"
+        memory_manager.add_state(ADMIN_ID, "awaiting_admin_user_id_for_agent")
     
     elif data == "admin_remove_user_action":
         await query.message.reply_text("🆔 ایدی عددی کاربری که می‌خواهید حذف کنید را وارد کنید:")
-        user_states[ADMIN_ID] = "awaiting_user_id_for_removal"
+        memory_manager.add_state(ADMIN_ID, "awaiting_user_id_for_removal")
 
 async def start_with_param(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
@@ -2342,7 +2399,7 @@ application.add_handler(CommandHandler("notification", notification_command))
 application.add_handler(CommandHandler("backup", backup_command))
 application.add_handler(CommandHandler("restore", restore_command))
 application.add_handler(CommandHandler("remove_user", remove_user_command))
-application.add_handler(CommandHandler("cleanup", cleanup_command))  # ADDED
+application.add_handler(CommandHandler("cleanup", cleanup_command))
 application.add_handler(MessageHandler(filters.ALL & (~filters.COMMAND), message_handler))
 application.add_handler(CallbackQueryHandler(admin_callback_handler))
 
@@ -2354,17 +2411,14 @@ async def health_check():
 @app.get("/health")
 async def health():
     try:
-        # بررسی اتصال به دیتابیس
         await db_execute("SELECT 1", fetchone=True)
+        memory_stats = memory_manager.get_stats()
         return {
             "status": "healthy",
             "database": "connected",
             "bot": "running",
             "timestamp": datetime.now().isoformat(),
-            "memory_stats": {  # ADDED: Memory statistics
-                "user_states_size": len(user_states),
-                "active_connections": len(active_connections)
-            }
+            "memory_stats": memory_stats
         }
     except Exception as e:
         return {
@@ -2395,40 +2449,32 @@ async def telegram_webhook(request: Request):
 async def on_startup():
     """رویداد شروع برنامه"""
     try:
-        # راه‌اندازی connection pool
         init_db_pool()
-        
-        # ساخت جداول دیتابیس
         await create_tables()
-        
-        # شروع application
         await application.initialize()
         await application.start()
-        
-        # تنظیم وب‌هوک
         await application.bot.set_webhook(url=WEBHOOK_URL)
         logging.info(f"✅ Webhook set successfully: {WEBHOOK_URL}")
-        
-        # تنظیم دستورات بات
         await set_bot_commands()
         
-        # ADDED: شروع پاکسازی خودکار
         global cleanup_task
         cleanup_task = asyncio.create_task(auto_cleanup_task())
         logging.info("✅ Auto cleanup task started")
         
-        # ارسال پیام شروع به ادمین
         try:
             await application.bot.send_message(
                 chat_id=ADMIN_ID,
                 text="🤖 ربات تیز VPN با موفقیت راه‌اندازی شد!\n"
                      f"⏰ زمان: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
                      f"🌐 وب‌هوک: {RENDER_BASE_URL}\n\n"
-                     "🆕 قابلیت‌های جدید:\n"
-                     "1️⃣ دستور `/remove_user` برای حذف کاربران\n"
-                     "2️⃣ اطلاع‌رسانی خودکار کاربران جدید به ادمین\n"
-                     "3️⃣ پاکسازی خودکار حافظه (هر 15 دقیقه)\n"
-                     "4️⃣ دستور `/cleanup` برای پاکسازی دستی"
+                     "🆕 قابلیت‌های جدید پاکسازی حافظه:\n"
+                     "1️⃣ دستور `/cleanup` برای پاکسازی دستی\n"
+                     "2️⃣ پاکسازی خودکار هر 15 دقیقه\n"
+                     "3️⃣ مدیریت هوشمند حافظه\n"
+                     "4️⃣ گزارش وضعیت حافظه در آمار\n\n"
+                     "💾 وضعیت حافظه فعلی:\n"
+                     f"• state‌های فعال: {len(memory_manager.user_states)}\n"
+                     f"• مصرف RAM: {memory_manager.get_memory_usage()['rss_mb']:.2f}MB"
             )
         except Exception as e:
             logging.error(f"Error sending startup message to admin: {e}")
@@ -2444,7 +2490,6 @@ async def on_startup():
 async def on_shutdown():
     """رویداد خاموش شدن برنامه"""
     try:
-        # ADDED: متوقف کردن پاکسازی خودکار
         global cleanup_task
         if cleanup_task:
             cleanup_task.cancel()
@@ -2455,27 +2500,25 @@ async def on_shutdown():
             cleanup_task = None
             logging.info("✅ Auto cleanup task stopped")
         
-        # ارسال پیام خاموش شدن به ادمین
         try:
             await application.bot.send_message(
                 chat_id=ADMIN_ID,
                 text="⚠️ ربات تیز VPN در حال خاموش شدن...\n"
-                     f"⏰ زمان: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                     f"⏰ زمان: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                     f"💾 وضعیت نهایی حافظه:\n"
+                     f"• state‌های فعال: {len(memory_manager.user_states)}\n"
+                     f"• مصرف RAM: {memory_manager.get_memory_usage()['rss_mb']:.2f}MB"
             )
         except Exception as e:
             logging.error(f"Error sending shutdown message to admin: {e}")
         
-        # متوقف کردن application
         await application.stop()
         await application.shutdown()
-        
-        # بستن connection pool
         close_db_pool()
         
-        # ADDED: پاکسازی نهایی
-        user_states.clear()
+        memory_manager.user_states.clear()
+        memory_manager.state_timestamps.clear()
         active_connections.clear()
-        import gc
         gc.collect()
         
         logging.info("✅ Bot shut down successfully")
@@ -2491,5 +2534,7 @@ if __name__ == "__main__":
         app, 
         host="0.0.0.0", 
         port=port,
-        log_level="info"
+        log_level="info",
+        # کاهش کارگران برای صرفه‌جویی در حافظه
+        workers=1
     )
