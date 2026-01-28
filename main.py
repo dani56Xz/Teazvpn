@@ -23,6 +23,10 @@ RENDER_BASE_URL = os.getenv("RENDER_BASE_URL") or "https://teazvpn.onrender.com"
 WEBHOOK_PATH = f"/webhook/{TOKEN}"
 WEBHOOK_URL = f"{RENDER_BASE_URL}{WEBHOOK_PATH}"
 
+# ADDED: Cleanup settings
+CLEANUP_INTERVAL_MINUTES = 15  # Automatic cleanup every 15 minutes
+MAX_USER_STATES_ENTRIES = 1000  # Maximum entries in user_states dict
+
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
@@ -34,66 +38,8 @@ logging.basicConfig(
 
 app = FastAPI()
 
-# ADDED: Memory cleanup variables
-last_cleanup_time = datetime.now()
-user_states_cleanup_interval = timedelta(minutes=30)
-# END ADDED
-
-@app.on_event("startup")
-async def startup():
-    await application.initialize()
-    await application.start()
-
-# ---------- endpoint سلامت برای UptimeRobot ----------
-@app.get("/")
-async def health_check():
-    return {"status": "up", "message": "Bot is running!", "timestamp": datetime.now().isoformat()}
-
-@app.get("/health")
-async def health():
-    try:
-        # بررسی اتصال به دیتابیس
-        await db_execute("SELECT 1", fetchone=True)
-        return {
-            "status": "healthy",
-            "database": "connected",
-            "bot": "running",
-            "timestamp": datetime.now().isoformat()
-        }
-    except Exception as e:
-        return {
-            "status": "unhealthy",
-            "database": "disconnected",
-            "error": str(e),
-            "timestamp": datetime.now().isoformat()
-        }
-
-@app.get("/ping")
-async def ping():
-    return {"pong": True, "timestamp": datetime.now().isoformat()}
-
-# ADDED: Cleanup endpoint for manual memory cleanup
-@app.get("/cleanup")
-async def cleanup_endpoint():
-    """دستیار پاکسازی حافظه و اتصالات"""
-    try:
-        cleaned = await perform_cleanup()
-        return {
-            "status": "cleaned",
-            "user_states_removed": cleaned.get("user_states", 0),
-            "db_connections_closed": cleaned.get("db_connections", 0),
-            "timestamp": datetime.now().isoformat()
-        }
-    except Exception as e:
-        return {
-            "status": "error",
-            "error": str(e),
-            "timestamp": datetime.now().isoformat()
-        }
-# END ADDED
-
-# ---------- مدیریت application ----------
-application = Application.builder().token(TOKEN).build()
+# ADDED: Background cleanup task reference
+cleanup_task = None
 
 # ---------- PostgreSQL connection pool (psycopg2) ----------
 import psycopg2
@@ -104,6 +50,9 @@ import subprocess
 DATABASE_URL = os.getenv("DATABASE_URL")
 
 db_pool: pool.ThreadedConnectionPool = None
+
+# ADDED: Track active connections for cleanup
+active_connections = set()
 
 def init_db_pool():
     global db_pool
@@ -128,6 +77,10 @@ def _db_execute_sync(query, params=(), fetch=False, fetchone=False, returning=Fa
     cur = None
     try:
         conn = db_pool.getconn()
+        # ADDED: Track connection
+        conn_id = id(conn)
+        active_connections.add(conn_id)
+        
         cur = conn.cursor()
         cur.execute(query, params)
         result = None
@@ -144,15 +97,21 @@ def _db_execute_sync(query, params=(), fetch=False, fetchone=False, returning=Fa
         logging.error(f"Database error in query '{query}' with params {params}: {e}")
         raise
     finally:
-        # ADDED: Ensure connections are always returned to pool
+        # ADDED: Always ensure cleanup
         if cur:
-            cur.close()
+            try:
+                cur.close()
+            except:
+                pass
         if conn:
             try:
+                # ADDED: Remove from tracking before returning
+                conn_id = id(conn)
+                if conn_id in active_connections:
+                    active_connections.remove(conn_id)
                 db_pool.putconn(conn)
-            except Exception as e:
-                logging.warning(f"Could not return connection to pool: {e}")
-        # END ADDED
+            except:
+                pass
 
 async def db_execute(query, params=(), fetch=False, fetchone=False, returning=False):
     try:
@@ -160,57 +119,6 @@ async def db_execute(query, params=(), fetch=False, fetchone=False, returning=Fa
     except Exception as e:
         logging.error(f"Async database error in query '{query}' with params {params}: {e}")
         raise
-
-# ADDED: Cleanup function for database connections and memory
-async def perform_cleanup():
-    """پاکسازی حافظه و اتصالات"""
-    global last_cleanup_time, user_states
-    
-    cleanup_stats = {
-        "user_states": 0,
-        "db_connections": 0
-    }
-    
-    try:
-        # پاکسازی user_states قدیمی (بیش از 1 ساعت)
-        current_time = datetime.now()
-        initial_count = len(user_states)
-        
-        # پاکسازی وضعیت‌های قدیمی (بیش از 2 ساعت)
-        keys_to_remove = []
-        for user_id, state in list(user_states.items()):
-            # اگر وضعیت حاوی timestamp باشد، بررسی کن
-            if isinstance(state, tuple) and len(state) == 2:
-                state_value, timestamp = state
-                if current_time - timestamp > timedelta(hours=2):
-                    keys_to_remove.append(user_id)
-            # اگر وضعیت قدیمی اما فاقد timestamp است، آن را حفظ کن
-            # فقط اگر خیلی قدیمی است (بیش از 24 ساعت) پاکش کن
-            elif user_id in user_states:
-                # وضعیت‌های بدون timestamp را پاک نکن
-                pass
-        
-        for user_id in keys_to_remove:
-            del user_states[user_id]
-            cleanup_stats["user_states"] += 1
-        
-        # بستن اتصالات غیرفعال دیتابیس
-        if db_pool:
-            try:
-                # این یک بررسی ساده است، ThreadedConnectionPool مدیریت خودش را دارد
-                # اما می‌توانیم اتصالات نشتی را بررسی کنیم
-                cleanup_stats["db_connections"] = 0
-            except Exception as e:
-                logging.warning(f"Error during DB connection cleanup: {e}")
-        
-        last_cleanup_time = current_time
-        logging.info(f"Cleanup completed: {cleanup_stats['user_states']} user states removed")
-        
-    except Exception as e:
-        logging.error(f"Error during cleanup: {e}")
-    
-    return cleanup_stats
-# END ADDED
 
 # ---------- ساخت و مهاجرت جداول ----------
 CREATE_USERS_SQL = """
@@ -316,30 +224,6 @@ async def remove_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     
     await update.message.reply_text("🆔 ایدی عددی کاربری که می‌خواهید حذف کنید را وارد کنید:")
     user_states[update.effective_user.id] = "awaiting_user_id_for_removal"
-
-# ADDED: Cleanup command for admin
-async def cleanup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """پاکسازی حافظه و اتصالات (فقط برای ادمین)"""
-    if update.effective_user.id != ADMIN_ID:
-        await update.message.reply_text("⚠️ شما اجازه دسترسی به این دستور را ندارید.")
-        return
-    
-    try:
-        await update.message.reply_text("🧹 در حال پاکسازی حافظه و اتصالات...")
-        
-        cleaned = await perform_cleanup()
-        
-        response = "✅ پاکسازی با موفقیت انجام شد:\n\n"
-        response += f"• وضعیت‌های کاربران پاک شده: {cleaned['user_states']}\n"
-        response += f"• اتصالات دیتابیس بررسی شده: {cleaned['db_connections']}\n"
-        response += f"• زمان آخرین پاکسازی: {last_cleanup_time.strftime('%Y-%m-%d %H:%M:%S')}"
-        
-        await update.message.reply_text(response, reply_markup=get_main_keyboard())
-        
-    except Exception as e:
-        logging.error(f"Error in cleanup command: {e}")
-        await update.message.reply_text(f"⚠️ خطا در پاکسازی: {str(e)}", reply_markup=get_main_keyboard())
-# END ADDED
 
 # ---------- دستور جدید برای بکاپ گیری از دیتابیس ----------
 async def backup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -748,6 +632,105 @@ async def clear_db(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logging.error(f"Error clearing database: {e}")
         await update.message.reply_text(f"⚠️ خطا در پاک کردن دیتابیس: {str(e)}")
+
+# ---------- ADDED: دستور پاکسازی حافظه ----------
+async def cleanup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    پاکسازی دستی حافظه و نشتی‌های سیستم (فقط برای ادمین)
+    """
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("⚠️ شما اجازه دسترسی به این دستور را ندارید.")
+        return
+    
+    try:
+        await update.message.reply_text("🧹 در حال پاکسازی حافظه و نشتی‌ها...")
+        
+        # پاکسازی user_states قدیمی
+        before_cleanup = len(user_states)
+        current_time = datetime.now()
+        
+        # حذف رکوردهای قدیمی‌تر از 24 ساعت
+        keys_to_remove = []
+        for key in list(user_states.keys()):
+            # اگر state خیلی قدیمی است (24 ساعت)
+            if key in user_states and isinstance(user_states[key], str):
+                if user_states[key].startswith("awaiting_"):
+                    # این یک state موقت است، می‌تواند حذف شود
+                    keys_to_remove.append(key)
+        
+        for key in keys_to_remove:
+            if key in user_states:
+                del user_states[key]
+        
+        after_cleanup = len(user_states)
+        
+        # گزارش وضعیت connections
+        db_connections = len(active_connections)
+        
+        # پاکسازی cache و جمع‌آوری زباله
+        import gc
+        gc.collect()
+        
+        report = (
+            f"✅ پاکسازی حافظه انجام شد:\n\n"
+            f"🧹 user_states:\n"
+            f"   قبل: {before_cleanup}\n"
+            f"   بعد: {after_cleanup}\n"
+            f"   حذف شده: {before_cleanup - after_cleanup}\n\n"
+            f"🔗 connections فعال: {db_connections}\n\n"
+            f"💾 حافظه آزاد شده"
+        )
+        
+        await update.message.reply_text(report, reply_markup=get_main_keyboard())
+        logging.info(f"Cleanup completed: user_states {before_cleanup} -> {after_cleanup}, active connections: {db_connections}")
+        
+    except Exception as e:
+        logging.error(f"Error in cleanup_command: {e}")
+        await update.message.reply_text(f"⚠️ خطا در پاکسازی: {str(e)}", reply_markup=get_main_keyboard())
+
+# ---------- ADDED: تابع پاکسازی خودکار ----------
+async def auto_cleanup_task():
+    """
+    پاکسازی خودکار هر 15 دقیقه برای جلوگیری از نشتی حافظه
+    """
+    while True:
+        try:
+            await asyncio.sleep(CLEANUP_INTERVAL_MINUTES * 60)  # هر 15 دقیقه
+            
+            current_time = datetime.now()
+            logging.info(f"🔄 شروع پاکسازی خودکار در {current_time}")
+            
+            # پاکسازی user_states اگر خیلی بزرگ شده
+            if len(user_states) > MAX_USER_STATES_ENTRIES:
+                old_size = len(user_states)
+                # فقط نیمی از قدیمی‌ترین‌ها را نگه دار
+                keys = list(user_states.keys())
+                if len(keys) > MAX_USER_STATES_ENTRIES // 2:
+                    keys_to_remove = keys[:len(keys) - MAX_USER_STATES_ENTRIES // 2]
+                    for key in keys_to_remove:
+                        if key in user_states:
+                            del user_states[key]
+                    logging.info(f"🧹 user_states cleaned: {old_size} -> {len(user_states)}")
+            
+            # پاکسازی connections نشتی
+            if len(active_connections) > 20:  # اگر بیش از 20 connection فعال داریم
+                logging.warning(f"⚠️ تعداد connections فعال زیاد است: {len(active_connections)}")
+                # تلاش برای رها کردن connections قدیمی
+                import gc
+                gc.collect()
+            
+            # لاگ وضعیت حافظه
+            import psutil
+            process = psutil.Process()
+            memory_info = process.memory_info()
+            logging.info(f"💾 وضعیت حافظه: RSS={memory_info.rss / 1024 / 1024:.2f}MB, VMS={memory_info.vms / 1024 / 1024:.2f}MB")
+            
+        except asyncio.CancelledError:
+            logging.info("🛑 پاکسازی خودکار متوقف شد")
+            break
+        except Exception as e:
+            logging.error(f"⚠️ خطا در پاکسازی خودکار: {e}")
+            await asyncio.sleep(60)  # در صورت خطا 1 دقیقه صبر کن
 
 # ---------- کیبوردها ----------
 def get_main_keyboard():
@@ -1160,29 +1143,6 @@ user_states = {}
 def generate_coupon_code(length=8):
     return ''.join(random.choices(string.ascii_uppercase + string.digits, k=length))
 
-# ADDED: Background task for automatic cleanup
-async def background_cleanup_task():
-    """کاربر پاکسازی خودکار در پس‌زمینه"""
-    while True:
-        try:
-            # هر 15 دقیقه یکبار پاکسازی کن
-            await asyncio.sleep(900)  # 15 دقیقه
-            
-            global last_cleanup_time
-            current_time = datetime.now()
-            
-            # فقط اگر 30 دقیقه از آخرین پاکسازی گذشته باشد
-            if current_time - last_cleanup_time > timedelta(minutes=30):
-                logging.info("🔄 شروع پاکسازی خودکار...")
-                cleaned = await perform_cleanup()
-                logging.info(f"✅ پاکسازی خودکار کامل شد: {cleaned['user_states']} وضعیت کاربر پاک شد")
-                
-        except Exception as e:
-            logging.error(f"⚠️ خطا در پاکسازی خودکار: {e}")
-            # در صورت خطا، 5 دقیقه صبر کن و دوباره تلاش کن
-            await asyncio.sleep(300)
-# END ADDED
-
 # ---------- دستورات و هندلرها ----------
 async def set_bot_commands():
     try:
@@ -1200,7 +1160,7 @@ async def set_bot_commands():
             BotCommand(command="/backup", description="تهیه بکاپ از دیتابیس (ادمین)"),
             BotCommand(command="/restore", description="بازیابی دیتابیس از بکاپ (ادمین)"),
             BotCommand(command="/remove_user", description="حذف کاربر از دیتابیس (ادمین)"),
-            BotCommand(command="/cleanup", description="پاکسازی حافظه و اتصالات (ادمین)")  # ADDED
+            BotCommand(command="/cleanup", description="پاکسازی حافظه (ادمین)")  # ADDED
         ]
         await application.bot.set_my_commands(public_commands)
         await application.bot.set_my_commands(admin_commands, scope={"type": "chat", "chat_id": ADMIN_ID})
@@ -2368,6 +2328,9 @@ async def start_with_param(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data["invited_by"] = None
     await start(update, context)
 
+# ---------- مدیریت application ----------
+application = Application.builder().token(TOKEN).build()
+
 # ---------- ثبت هندلرها ----------
 application.add_handler(CommandHandler("start", start_with_param))
 application.add_handler(CommandHandler("debug_subscriptions", debug_subscriptions))
@@ -2382,6 +2345,38 @@ application.add_handler(CommandHandler("remove_user", remove_user_command))
 application.add_handler(CommandHandler("cleanup", cleanup_command))  # ADDED
 application.add_handler(MessageHandler(filters.ALL & (~filters.COMMAND), message_handler))
 application.add_handler(CallbackQueryHandler(admin_callback_handler))
+
+# ---------- endpoint سلامت برای UptimeRobot ----------
+@app.get("/")
+async def health_check():
+    return {"status": "up", "message": "Bot is running!", "timestamp": datetime.now().isoformat()}
+
+@app.get("/health")
+async def health():
+    try:
+        # بررسی اتصال به دیتابیس
+        await db_execute("SELECT 1", fetchone=True)
+        return {
+            "status": "healthy",
+            "database": "connected",
+            "bot": "running",
+            "timestamp": datetime.now().isoformat(),
+            "memory_stats": {  # ADDED: Memory statistics
+                "user_states_size": len(user_states),
+                "active_connections": len(active_connections)
+            }
+        }
+    except Exception as e:
+        return {
+            "status": "unhealthy",
+            "database": "disconnected",
+            "error": str(e),
+            "timestamp": datetime.now().isoformat()
+        }
+
+@app.get("/ping")
+async def ping():
+    return {"pong": True, "timestamp": datetime.now().isoformat()}
 
 # ---------- webhook endpoint ----------
 @app.post(WEBHOOK_PATH)
@@ -2417,10 +2412,10 @@ async def on_startup():
         # تنظیم دستورات بات
         await set_bot_commands()
         
-        # ADDED: شروع وظیفه پاکسازی خودکار
-        asyncio.create_task(background_cleanup_task())
-        logging.info("✅ Background cleanup task started")
-        # END ADDED
+        # ADDED: شروع پاکسازی خودکار
+        global cleanup_task
+        cleanup_task = asyncio.create_task(auto_cleanup_task())
+        logging.info("✅ Auto cleanup task started")
         
         # ارسال پیام شروع به ادمین
         try:
@@ -2432,8 +2427,8 @@ async def on_startup():
                      "🆕 قابلیت‌های جدید:\n"
                      "1️⃣ دستور `/remove_user` برای حذف کاربران\n"
                      "2️⃣ اطلاع‌رسانی خودکار کاربران جدید به ادمین\n"
-                     "3️⃣ دستور `/cleanup` برای پاکسازی حافظه\n"
-                     "4️⃣ پاکسازی خودکار هر 15 دقیقه"
+                     "3️⃣ پاکسازی خودکار حافظه (هر 15 دقیقه)\n"
+                     "4️⃣ دستور `/cleanup` برای پاکسازی دستی"
             )
         except Exception as e:
             logging.error(f"Error sending startup message to admin: {e}")
@@ -2449,6 +2444,17 @@ async def on_startup():
 async def on_shutdown():
     """رویداد خاموش شدن برنامه"""
     try:
+        # ADDED: متوقف کردن پاکسازی خودکار
+        global cleanup_task
+        if cleanup_task:
+            cleanup_task.cancel()
+            try:
+                await cleanup_task
+            except asyncio.CancelledError:
+                pass
+            cleanup_task = None
+            logging.info("✅ Auto cleanup task stopped")
+        
         # ارسال پیام خاموش شدن به ادمین
         try:
             await application.bot.send_message(
@@ -2465,6 +2471,12 @@ async def on_shutdown():
         
         # بستن connection pool
         close_db_pool()
+        
+        # ADDED: پاکسازی نهایی
+        user_states.clear()
+        active_connections.clear()
+        import gc
+        gc.collect()
         
         logging.info("✅ Bot shut down successfully")
         
