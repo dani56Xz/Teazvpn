@@ -2595,129 +2595,145 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
         await query.edit_message_text("⚠️ شما اجازه این کار را ندارید.")
         return
 
-    if data.startswith("approve_"):
-        payment_id = int(data.split("_")[1])
-        payment = await db_execute("SELECT user_id, amount, type, description FROM payments WHERE id = %s", (payment_id,), fetchone=True)
-        if not payment:
-            await query.edit_message_text("⚠️ پرداخت یافت نشد.")
-            return
-        user_id, amount, ptype, description = payment
-
-        await update_payment_status(payment_id, "approved")
-        if ptype == "increase_balance":
-            await add_balance(user_id, amount)
-            await context.bot.send_message(user_id, f"💰 پرداخت تایید شد. موجودی {amount} تومان اضافه شد.")
-            await query.edit_message_reply_markup(None)
-            await query.edit_message_text("✅ پرداخت تایید شد.")
-        elif ptype == "buy_subscription":
-            await context.bot.send_message(user_id, f"✅ پرداخت تایید شد. اشتراک شما (کد خرید: #{payment_id}) ارسال خواهد شد.")
-            config_keyboard = InlineKeyboardMarkup([
-                [InlineKeyboardButton("🟣 ارسال کانفیگ", callback_data=f"send_config_{payment_id}")]
-            ])
-            await query.edit_message_reply_markup(None)
-            await query.edit_message_text(f"✅ پرداخت برای اشتراک ({description}) تایید شد.", reply_markup=config_keyboard)
-        elif ptype == "agency_request":
-            await set_user_agent(user_id)
-            await add_balance(user_id, amount)
-            await context.bot.send_message(user_id, "✅ فیش شما تایید و نمایندگی به شما اعطا شد! ۱,۰۰۰,۰۰۰ تومان به موجودی شما اضافه شد.")
-            await query.edit_message_reply_markup(None)
-            await query.edit_message_text("✅ درخواست نمایندگی تایید شد.")
-
-    elif data.startswith("reject_"):
-        payment_id = int(data.split("_")[1])
-        payment = await db_execute("SELECT user_id, amount, type FROM payments WHERE id = %s", (payment_id,), fetchone=True)
-        if not payment:
-            await query.edit_message_text("⚠️ پرداخت یافت نشد.")
-            return
-        user_id, amount, ptype = payment
-
-        await update_payment_status(payment_id, "rejected")
-        await context.bot.send_message(user_id, "❌ پرداخت شما رد شد. با پشتیبانی تماس بگیرید.")
-        await query.edit_message_reply_markup(None)
-        await query.edit_message_text("❌ پرداخت رد شد.")
-
-    elif data.startswith("send_config_"):
-        payment_id = int(data.split("_")[-1])
-        payment = await db_execute("SELECT user_id, description FROM payments WHERE id = %s", (payment_id,), fetchone=True)
-        if not payment:
-            await query.edit_message_text("⚠️ پرداخت یافت نشد.")
-            return
-        
-        # پاسخ به کوئری اول
-        await query.answer("لطفا کانفیگ را ارسال کنید...")
-        
-        # ارسال پیام جداگانه به ادمین
-        await context.bot.send_message(
-            chat_id=ADMIN_ID,
-            text=f"📤 برای پرداخت #{payment_id} لطفا کانفیگ را ارسال کنید:",
-            reply_to_message_id=query.message.message_id
-        )
-        user_states[ADMIN_ID] = f"awaiting_config_{payment_id}"
-    
-    elif data.startswith("approve_config_"):
-        # قسمت اصلاح شده: تایید کانفیگ رایگان
-        config_id = int(data.split("_")[-1])
-        config = await db_execute("SELECT file_id, uploaded_by FROM free_configs WHERE id = %s", (config_id,), fetchone=True)
-        if not config:
-            await query.edit_message_text("⚠️ کانفیگ یافت نشد.")
-            return
-        
-        file_id, uploaded_by = config
-        success = await approve_free_config(config_id, ADMIN_ID)
-        if success:
-            await query.edit_message_reply_markup(None)
-            await query.edit_message_text("✅ کانفیگ تایید شد و به بخش کانفیگ‌های رایگان اضافه شد.")
+    try:
+        # پردازش تایید کانفیگ رایگان
+        if data.startswith("approve_config_"):
+            config_id = int(data.split("_")[-1])
+            config = await db_execute("SELECT file_id, uploaded_by FROM free_configs WHERE id = %s", (config_id,), fetchone=True)
+            if not config:
+                await query.edit_message_text("⚠️ کانفیگ یافت نشد.")
+                return
             
-            # اطلاع به کاربری که کانفیگ را ارسال کرده
-            try:
-                await context.bot.send_message(
-                    chat_id=uploaded_by,
-                    text="✅ کانفیگی که ارسال کردید توسط ادمین تایید شد و به بخش کانفیگ‌های رایگان اضافه گردید."
-                )
-            except Exception as e:
-                logging.error(f"Error notifying user {uploaded_by} about config approval: {e}")
-        else:
-            await query.edit_message_text("⚠️ خطا در تایید کانفیگ.")
-    
-    elif data.startswith("reject_config_"):
-        # قسمت اصلاح شده: رد کانفیگ رایگان
-        config_id = int(data.split("_")[-1])
-        config = await db_execute("SELECT uploaded_by FROM free_configs WHERE id = %s", (config_id,), fetchone=True)
-        if not config:
-            await query.edit_message_text("⚠️ کانفیگ یافت نشد.")
-            return
+            file_id, uploaded_by = config
+            success = await approve_free_config(config_id, ADMIN_ID)
+            if success:
+                await query.edit_message_reply_markup(None)
+                await query.edit_message_text("✅ کانفیگ تایید شد و به بخش کانفیگ‌های رایگان اضافه شد.")
+                
+                # اطلاع به کاربری که کانفیگ را ارسال کرده
+                try:
+                    await context.bot.send_message(
+                        chat_id=uploaded_by,
+                        text="✅ کانفیگی که ارسال کردید توسط ادمین تایید شد و به بخش کانفیگ‌های رایگان اضافه گردید."
+                    )
+                except Exception as e:
+                    logging.error(f"Error notifying user {uploaded_by} about config approval: {e}")
+            else:
+                await query.edit_message_text("⚠️ خطا در تایید کانفیگ.")
         
-        uploaded_by = config[0]
-        success = await reject_free_config(config_id)
-        if success:
-            await query.edit_message_reply_markup(None)
-            await query.edit_message_text("❌ کانفیگ رد شد.")
+        # پردازش رد کانفیگ رایگان
+        elif data.startswith("reject_config_"):
+            config_id = int(data.split("_")[-1])
+            config = await db_execute("SELECT uploaded_by FROM free_configs WHERE id = %s", (config_id,), fetchone=True)
+            if not config:
+                await query.edit_message_text("⚠️ کانفیگ یافت نشد.")
+                return
             
-            # اطلاع به کاربری که کانفیگ را ارسال کرده
-            try:
-                await context.bot.send_message(
-                    chat_id=uploaded_by,
-                    text="❌ کانفیگی که ارسال کردید توسط ادمین رد شد."
-                )
-            except Exception as e:
-                logging.error(f"Error notifying user {uploaded_by} about config rejection: {e}")
+            uploaded_by = config[0]
+            success = await reject_free_config(config_id)
+            if success:
+                await query.edit_message_reply_markup(None)
+                await query.edit_message_text("❌ کانفیگ رد شد.")
+                
+                # اطلاع به کاربری که کانفیگ را ارسال کرده
+                try:
+                    await context.bot.send_message(
+                        chat_id=uploaded_by,
+                        text="❌ کانفیگی که ارسال کردید توسط ادمین رد شد."
+                    )
+                except Exception as e:
+                    logging.error(f"Error notifying user {uploaded_by} about config rejection: {e}")
+            else:
+                await query.edit_message_text("⚠️ خطا در رد کانفیگ.")
+        
+        # پردازش تایید پرداخت
+        elif data.startswith("approve_") and not data.startswith("approve_config_"):
+            # پردازش پرداخت معمولی (غیر از کانفیگ رایگان)
+            payment_id = int(data.split("_")[1])
+            payment = await db_execute("SELECT user_id, amount, type, description FROM payments WHERE id = %s", (payment_id,), fetchone=True)
+            if not payment:
+                await query.edit_message_text("⚠️ پرداخت یافت نشد.")
+                return
+            
+            user_id, amount, ptype, description = payment
+            await update_payment_status(payment_id, "approved")
+            
+            if ptype == "increase_balance":
+                await add_balance(user_id, amount)
+                await context.bot.send_message(user_id, f"💰 پرداخت تایید شد. موجودی {amount} تومان اضافه شد.")
+                await query.edit_message_reply_markup(None)
+                await query.edit_message_text("✅ پرداخت تایید شد.")
+            
+            elif ptype == "buy_subscription":
+                await context.bot.send_message(user_id, f"✅ پرداخت تایید شد. اشتراک شما (کد خرید: #{payment_id}) ارسال خواهد شد.")
+                config_keyboard = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🟣 ارسال کانفیگ", callback_data=f"send_config_{payment_id}")]
+                ])
+                await query.edit_message_reply_markup(None)
+                await query.edit_message_text(f"✅ پرداخت برای اشتراک ({description}) تایید شد.", reply_markup=config_keyboard)
+            
+            elif ptype == "agency_request":
+                await set_user_agent(user_id)
+                await add_balance(user_id, amount)
+                await context.bot.send_message(user_id, "✅ فیش شما تایید و نمایندگی به شما اعطا شد! ۱,۰۰۰,۰۰۰ تومان به موجودی شما اضافه شد.")
+                await query.edit_message_reply_markup(None)
+                await query.edit_message_text("✅ درخواست نمایندگی تایید شد.")
+        
+        # پردازش رد پرداخت
+        elif data.startswith("reject_") and not data.startswith("reject_config_"):
+            payment_id = int(data.split("_")[1])
+            payment = await db_execute("SELECT user_id, amount, type FROM payments WHERE id = %s", (payment_id,), fetchone=True)
+            if not payment:
+                await query.edit_message_text("⚠️ پرداخت یافت نشد.")
+                return
+            
+            user_id, amount, ptype = payment
+            await update_payment_status(payment_id, "rejected")
+            await context.bot.send_message(user_id, "❌ پرداخت شما رد شد. با پشتیبانی تماس بگیرید.")
+            await query.edit_message_reply_markup(None)
+            await query.edit_message_text("❌ پرداخت رد شد.")
+        
+        # پردازش درخواست ارسال کانفیگ
+        elif data.startswith("send_config_"):
+            payment_id = int(data.split("_")[-1])
+            payment = await db_execute("SELECT user_id, description FROM payments WHERE id = %s", (payment_id,), fetchone=True)
+            if not payment:
+                await query.edit_message_text("⚠️ پرداخت یافت نشد.")
+                return
+            
+            await query.answer("لطفا کانفیگ را ارسال کنید...")
+            await context.bot.send_message(
+                chat_id=ADMIN_ID,
+                text=f"📤 برای پرداخت #{payment_id} لطفا کانفیگ را ارسال کنید:",
+                reply_to_message_id=query.message.message_id
+            )
+            user_states[ADMIN_ID] = f"awaiting_config_{payment_id}"
+        
+        # پردازش سایر اقدامات ادمین
+        elif data == "admin_balance_action":
+            await query.edit_message_reply_markup(None)
+            await query.edit_message_text("🆔 ایدی عددی کاربر را وارد کنید:")
+            user_states[ADMIN_ID] = "awaiting_admin_user_id_for_balance"
+        
+        elif data == "admin_agent_action":
+            await query.edit_message_reply_markup(None)
+            await query.edit_message_text("🆔 ایدی عددی کاربر را وارد کنید:")
+            user_states[ADMIN_ID] = "awaiting_admin_user_id_for_agent"
+        
+        elif data == "admin_remove_user_action":
+            await query.edit_message_reply_markup(None)
+            await query.edit_message_text("🆔 ایدی عددی کاربری که می‌خواهید حذف کنید را وارد کنید:")
+            user_states[ADMIN_ID] = "awaiting_user_id_for_removal"
+        
         else:
-            await query.edit_message_text("⚠️ خطا در رد کانفیگ.")
-    
-    elif data == "admin_balance_action":
-        await query.edit_message_reply_markup(None)
-        await query.edit_message_text("🆔 ایدی عددی کاربر را وارد کنید:")
-        user_states[ADMIN_ID] = "awaiting_admin_user_id_for_balance"
-    
-    elif data == "admin_agent_action":
-        await query.edit_message_reply_markup(None)
-        await query.edit_message_text("🆔 ایدی عددی کاربر را وارد کنید:")
-        user_states[ADMIN_ID] = "awaiting_admin_user_id_for_agent"
-    
-    elif data == "admin_remove_user_action":
-        await query.edit_message_reply_markup(None)
-        await query.edit_message_text("🆔 ایدی عددی کاربری که می‌خواهید حذف کنید را وارد کنید:")
-        user_states[ADMIN_ID] = "awaiting_user_id_for_removal"
+            await query.edit_message_text("⚠️ دستور نامعتبر است.")
+            
+    except ValueError as e:
+        logging.error(f"Error parsing callback data '{data}': {e}")
+        await query.edit_message_text(f"⚠️ خطا در پردازش دستور: {data}")
+    except Exception as e:
+        logging.error(f"Error in admin_callback_handler: {e}")
+        await query.edit_message_text("⚠️ خطا در پردازش درخواست.")
 
 async def start_with_param(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
