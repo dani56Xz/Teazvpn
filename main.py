@@ -2639,7 +2639,16 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
         if not payment:
             await query.edit_message_text("⚠️ پرداخت یافت نشد.")
             return
-        await query.message.reply_text("لطفا کانفیگ را ارسال کنید.")
+        
+        # پاسخ به کوئری اول
+        await query.answer("لطفا کانفیگ را ارسال کنید...")
+        
+        # ارسال پیام جداگانه به ادمین
+        await context.bot.send_message(
+            chat_id=ADMIN_ID,
+            text=f"📤 برای پرداخت #{payment_id} لطفا کانفیگ را ارسال کنید:",
+            reply_to_message_id=query.message.message_id
+        )
         user_states[ADMIN_ID] = f"awaiting_config_{payment_id}"
     
     elif data.startswith("approve_config_"):
@@ -2667,15 +2676,18 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
             await query.edit_message_text("⚠️ خطا در رد کانفیگ.")
     
     elif data == "admin_balance_action":
-        await query.message.reply_text("🆔 ایدی عددی کاربر را وارد کنید:")
+        await query.edit_message_reply_markup(None)
+        await query.edit_message_text("🆔 ایدی عددی کاربر را وارد کنید:")
         user_states[ADMIN_ID] = "awaiting_admin_user_id_for_balance"
     
     elif data == "admin_agent_action":
-        await query.message.reply_text("🆔 ایدی عددی کاربر را وارد کنید:")
+        await query.edit_message_reply_markup(None)
+        await query.edit_message_text("🆔 ایدی عددی کاربر را وارد کنید:")
         user_states[ADMIN_ID] = "awaiting_admin_user_id_for_agent"
     
     elif data == "admin_remove_user_action":
-        await query.message.reply_text("🆔 ایدی عددی کاربری که می‌خواهید حذف کنید را وارد کنید:")
+        await query.edit_message_reply_markup(None)
+        await query.edit_message_text("🆔 ایدی عددی کاربری که می‌خواهید حذف کنید را وارد کنید:")
         user_states[ADMIN_ID] = "awaiting_user_id_for_removal"
 
 async def start_with_param(update: Update, context: ContextTypes.DEFAULT_TYPE):
