@@ -840,12 +840,15 @@ async def send_long_message(chat_id, text, context, reply_markup=None, parse_mod
         messages.append(current_message)
 
     for i, msg in enumerate(messages):
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=msg,
-            reply_markup=reply_markup if i == len(messages) - 1 else None,
-            parse_mode=parse_mode
-        )
+        if i == len(messages) - 1:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=msg,
+                reply_markup=reply_markup if i == len(messages) - 1 else None,
+                parse_mode=parse_mode
+            )
+        else:
+            await context.bot.send_message(chat_id=chat_id, text=msg)
 
 # ---------- توابع DB برای کوپن‌ها ----------
 async def create_coupon(code, discount_percent, user_id=None):
@@ -2583,7 +2586,7 @@ async def handle_agency_payment(update, context, user_id, text):
             user_states.pop(user_id, None)
         return
 
-async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     data = query.data
     await query.answer()
@@ -2652,6 +2655,7 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
         user_states[ADMIN_ID] = f"awaiting_config_{payment_id}"
     
     elif data.startswith("approve_config_"):
+        # قسمت اصلاح شده: تایید کانفیگ رایگان
         config_id = int(data.split("_")[-1])
         config = await db_execute("SELECT file_id, uploaded_by FROM free_configs WHERE id = %s", (config_id,), fetchone=True)
         if not config:
@@ -2663,15 +2667,40 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
         if success:
             await query.edit_message_reply_markup(None)
             await query.edit_message_text("✅ کانفیگ تایید شد و به بخش کانفیگ‌های رایگان اضافه شد.")
+            
+            # اطلاع به کاربری که کانفیگ را ارسال کرده
+            try:
+                await context.bot.send_message(
+                    chat_id=uploaded_by,
+                    text="✅ کانفیگی که ارسال کردید توسط ادمین تایید شد و به بخش کانفیگ‌های رایگان اضافه گردید."
+                )
+            except Exception as e:
+                logging.error(f"Error notifying user {uploaded_by} about config approval: {e}")
         else:
             await query.edit_message_text("⚠️ خطا در تایید کانفیگ.")
     
     elif data.startswith("reject_config_"):
+        # قسمت اصلاح شده: رد کانفیگ رایگان
         config_id = int(data.split("_")[-1])
+        config = await db_execute("SELECT uploaded_by FROM free_configs WHERE id = %s", (config_id,), fetchone=True)
+        if not config:
+            await query.edit_message_text("⚠️ کانفیگ یافت نشد.")
+            return
+        
+        uploaded_by = config[0]
         success = await reject_free_config(config_id)
         if success:
             await query.edit_message_reply_markup(None)
             await query.edit_message_text("❌ کانفیگ رد شد.")
+            
+            # اطلاع به کاربری که کانفیگ را ارسال کرده
+            try:
+                await context.bot.send_message(
+                    chat_id=uploaded_by,
+                    text="❌ کانفیگی که ارسال کردید توسط ادمین رد شد."
+                )
+            except Exception as e:
+                logging.error(f"Error notifying user {uploaded_by} about config rejection: {e}")
         else:
             await query.edit_message_text("⚠️ خطا در رد کانفیگ.")
     
@@ -2713,7 +2742,7 @@ application.add_handler(CommandHandler("backup", backup_command))
 application.add_handler(CommandHandler("restore", restore_command))
 application.add_handler(CommandHandler("remove_user", remove_user_command))
 application.add_handler(MessageHandler(filters.ALL & (~filters.COMMAND), message_handler))
-application.add_handler(CallbackQueryHandler(callback_query_handler))
+application.add_handler(CallbackQueryHandler(admin_callback_handler))
 
 # ---------- webhook endpoint ----------
 @app.post(WEBHOOK_PATH)
