@@ -173,6 +173,48 @@ CREATE TABLE IF NOT EXISTS coupons (
     expiry_date TIMESTAMP GENERATED ALWAYS AS (created_at + INTERVAL '3 days') STORED
 )
 """
+CREATE_FREE_CONFIGS_SQL = """
+CREATE TABLE IF NOT EXISTS free_configs (
+    id SERIAL PRIMARY KEY,
+    file_id TEXT NOT NULL,
+    file_name TEXT,
+    file_size INTEGER,
+    mime_type TEXT,
+    uploaded_by BIGINT,
+    uploaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    is_approved BOOLEAN DEFAULT FALSE,
+    approved_by BIGINT,
+    approved_at TIMESTAMP,
+    download_count INTEGER DEFAULT 0,
+    successful_count INTEGER DEFAULT 0,
+    unsuccessful_count INTEGER DEFAULT 0,
+    mci_success INTEGER DEFAULT 0,
+    mtn_success INTEGER DEFAULT 0,
+    rightel_success INTEGER DEFAULT 0,
+    mokhaberat_success INTEGER DEFAULT 0,
+    shatel_success INTEGER DEFAULT 0,
+    samantel_success INTEGER DEFAULT 0
+)
+"""
+CREATE_CONFIG_FEEDBACK_SQL = """
+CREATE TABLE IF NOT EXISTS config_feedback (
+    id SERIAL PRIMARY KEY,
+    config_id INTEGER REFERENCES free_configs(id),
+    user_id BIGINT,
+    worked BOOLEAN,
+    operator TEXT,
+    feedback_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+)
+"""
+CREATE_USER_DOWNLOADS_SQL = """
+CREATE TABLE IF NOT EXISTS user_downloads (
+    user_id BIGINT,
+    config_id INTEGER REFERENCES free_configs(id),
+    downloaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (user_id, config_id)
+)
+"""
+
 MIGRATE_SUBSCRIPTIONS_SQL = """
 DO $$
 BEGIN
@@ -214,6 +256,9 @@ async def create_tables():
         await db_execute(CREATE_PAYMENTS_SQL)
         await db_execute(CREATE_SUBSCRIPTIONS_SQL)
         await db_execute(CREATE_COUPONS_SQL)
+        await db_execute(CREATE_FREE_CONFIGS_SQL)
+        await db_execute(CREATE_CONFIG_FEEDBACK_SQL)
+        await db_execute(CREATE_USER_DOWNLOADS_SQL)
         await db_execute(MIGRATE_SUBSCRIPTIONS_SQL)
         logging.info("Database tables created and migrated successfully")
     except Exception as e:
@@ -591,6 +636,36 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             fetchone=True
         )
         
+        # آمار کانفیگ‌های رایگان
+        total_configs = await db_execute(
+            "SELECT COUNT(*) FROM free_configs WHERE is_approved = TRUE",
+            fetchone=True
+        )
+        
+        total_downloads = await db_execute(
+            "SELECT COUNT(*) FROM user_downloads",
+            fetchone=True
+        )
+        
+        total_feedback = await db_execute(
+            "SELECT COUNT(*) FROM config_feedback",
+            fetchone=True
+        )
+        
+        successful_configs = await db_execute(
+            "SELECT COUNT(*) FROM config_feedback WHERE worked = TRUE",
+            fetchone=True
+        )
+        
+        unsuccessful_configs = await db_execute(
+            "SELECT COUNT(*) FROM config_feedback WHERE worked = FALSE",
+            fetchone=True
+        )
+        
+        success_rate = 0
+        if total_feedback and total_feedback[0] > 0:
+            success_rate = round((successful_configs[0] / total_feedback[0]) * 100, 1) if successful_configs and successful_configs[0] else 0
+        
         stats_message = "🌟 گزارش عملکرد تیز VPN 🚀\n\n"
         stats_message += "👥 کاربران:\n"
         stats_message += f"  • کل کاربران: {total_users[0] if total_users else 0:,} نفر 🧑‍💻\n"
@@ -610,6 +685,14 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         stats_message += f"  • اشتراک‌های فعال: {active_subs[0] if active_subs else 0:,} عدد 🟢\n"
         stats_message += f"  • اشتراک‌های در انتظار: {pending_subs[0] if pending_subs else 0:,} عدد ⏳\n"
         stats_message += f"  • پرفروش‌ترین پلن: {best_selling_plan[0]} ({best_selling_plan[1]:,} عدد) 🏆\n\n"
+        
+        stats_message += "🎯 کانفیگ‌های رایگان:\n"
+        stats_message += f"  • کانفیگ‌های تایید شده: {total_configs[0] if total_configs else 0:,} عدد 📁\n"
+        stats_message += f"  • کل دانلودها: {total_downloads[0] if total_downloads else 0:,} بار 📥\n"
+        stats_message += f"  • بازخوردهای ثبت شده: {total_feedback[0] if total_feedback else 0:,} عدد 📝\n"
+        stats_message += f"  • موفقیت کانفیگ‌ها: {success_rate}% ✅\n"
+        stats_message += f"  • کانفیگ‌های موفق: {successful_configs[0] if successful_configs else 0:,} عدد 🟢\n"
+        stats_message += f"  • کانفیگ‌های ناموفق: {unsuccessful_configs[0] if unsuccessful_configs else 0:,} عدد 🔴\n\n"
         
         stats_message += "💳 روش‌های پرداخت:\n"
         for method, percent in payment_methods_percent:
@@ -642,10 +725,35 @@ async def clear_db(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------- کیبوردها ----------
 def get_main_keyboard():
     keyboard = [
+        [KeyboardButton("🇮🇷 کانفیگ های رایگان مردم")],
         [KeyboardButton("💰 موجودی"), KeyboardButton("💳 خرید اشتراک")],
         [KeyboardButton("🎁 اشتراک تست رایگان"), KeyboardButton("☎️ پشتیبانی")],
         [KeyboardButton("💵 اعتبار رایگان"), KeyboardButton("📂 اشتراک‌های من")],
         [KeyboardButton("💡 راهنمای اتصال"), KeyboardButton("🧑‍💼 درخواست نمایندگی")]
+    ]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
+def get_free_configs_keyboard():
+    keyboard = [
+        [KeyboardButton("📥 دریافت کانفیگ")],
+        [KeyboardButton("📤 ارسال کانفیگ")],
+        [KeyboardButton("⬅️ بازگشت به منو")]
+    ]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
+def get_operator_keyboard():
+    keyboard = [
+        [KeyboardButton("همراه اول"), KeyboardButton("ایرانسل")],
+        [KeyboardButton("رایتل"), KeyboardButton("مخابرات")],
+        [KeyboardButton("شاتل"), KeyboardButton("سامانتل")],
+        [KeyboardButton("⬅️ بازگشت به منو")]
+    ]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
+def get_feedback_keyboard():
+    keyboard = [
+        [KeyboardButton("کار کرد✅"), KeyboardButton("کار نکرد❌")],
+        [KeyboardButton("⬅️ بازگشت به منو")]
     ]
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
@@ -779,6 +887,167 @@ async def mark_coupon_used(code):
         logging.info(f"Coupon {code} marked as used")
     except Exception as e:
         logging.error(f"Error marking coupon {code} as used: {e}")
+
+# ---------- توابع DB برای کانفیگ‌های رایگان ----------
+async def save_free_config(file_id, file_name, file_size, mime_type, uploaded_by):
+    try:
+        config_id = await db_execute(
+            "INSERT INTO free_configs (file_id, file_name, file_size, mime_type, uploaded_by) VALUES (%s, %s, %s, %s, %s) RETURNING id",
+            (file_id, file_name, file_size, mime_type, uploaded_by), returning=True
+        )
+        logging.info(f"Free config saved with id: {config_id}, uploaded by: {uploaded_by}")
+        return config_id
+    except Exception as e:
+        logging.error(f"Error saving free config: {e}")
+        return None
+
+async def approve_free_config(config_id, approved_by):
+    try:
+        await db_execute(
+            "UPDATE free_configs SET is_approved = TRUE, approved_by = %s, approved_at = CURRENT_TIMESTAMP WHERE id = %s",
+            (approved_by, config_id)
+        )
+        logging.info(f"Free config {config_id} approved by {approved_by}")
+        return True
+    except Exception as e:
+        logging.error(f"Error approving free config {config_id}: {e}")
+        return False
+
+async def reject_free_config(config_id):
+    try:
+        await db_execute("DELETE FROM free_configs WHERE id = %s", (config_id,))
+        logging.info(f"Free config {config_id} rejected and deleted")
+        return True
+    except Exception as e:
+        logging.error(f"Error rejecting free config {config_id}: {e}")
+        return False
+
+async def get_random_approved_config(user_id):
+    try:
+        # دریافت کانفیگ‌های تایید شده ای که کاربر قبلاً دانلود نکرده است
+        configs = await db_execute(
+            """
+            SELECT fc.id, fc.file_id, fc.file_name, fc.download_count, fc.successful_count, 
+                   fc.unsuccessful_count, fc.mci_success, fc.mtn_success, fc.rightel_success, 
+                   fc.mokhaberat_success, fc.shatel_success, fc.samantel_success
+            FROM free_configs fc
+            LEFT JOIN user_downloads ud ON fc.id = ud.config_id AND ud.user_id = %s
+            WHERE fc.is_approved = TRUE AND ud.config_id IS NULL
+            """,
+            (user_id,), fetch=True
+        )
+        
+        if not configs:
+            # اگر همه کانفیگ‌ها دانلود شده‌اند، هیچ کانفیگی برنگردان
+            return None
+        
+        # انتخاب تصادفی یک کانفیگ
+        config = random.choice(configs)
+        
+        # ثبت دانلود کاربر
+        await db_execute(
+            "INSERT INTO user_downloads (user_id, config_id) VALUES (%s, %s)",
+            (user_id, config[0])
+        )
+        
+        # افزایش تعداد دانلودها
+        await db_execute(
+            "UPDATE free_configs SET download_count = download_count + 1 WHERE id = %s",
+            (config[0],)
+        )
+        
+        return {
+            'id': config[0],
+            'file_id': config[1],
+            'file_name': config[2],
+            'download_count': config[3],
+            'successful_count': config[4],
+            'unsuccessful_count': config[5],
+            'mci_success': config[6],
+            'mtn_success': config[7],
+            'rightel_success': config[8],
+            'mokhaberat_success': config[9],
+            'shatel_success': config[10],
+            'samantel_success': config[11]
+        }
+    except Exception as e:
+        logging.error(f"Error getting random approved config for user_id {user_id}: {e}")
+        return None
+
+async def save_config_feedback(config_id, user_id, worked, operator=None):
+    try:
+        await db_execute(
+            "INSERT INTO config_feedback (config_id, user_id, worked, operator) VALUES (%s, %s, %s, %s)",
+            (config_id, user_id, worked, operator)
+        )
+        
+        # بروزرسانی آمار کانفیگ
+        if worked:
+            await db_execute(
+                "UPDATE free_configs SET successful_count = successful_count + 1 WHERE id = %s",
+                (config_id,)
+            )
+            
+            # بروزرسانی آمار اپراتور
+            if operator:
+                operator_field = None
+                if operator == "همراه اول":
+                    operator_field = "mci_success"
+                elif operator == "ایرانسل":
+                    operator_field = "mtn_success"
+                elif operator == "رایتل":
+                    operator_field = "rightel_success"
+                elif operator == "مخابرات":
+                    operator_field = "mokhaberat_success"
+                elif operator == "شاتل":
+                    operator_field = "shatel_success"
+                elif operator == "سامانتل":
+                    operator_field = "samantel_success"
+                
+                if operator_field:
+                    await db_execute(
+                        f"UPDATE free_configs SET {operator_field} = {operator_field} + 1 WHERE id = %s",
+                        (config_id,)
+                    )
+        else:
+            await db_execute(
+                "UPDATE free_configs SET unsuccessful_count = unsuccessful_count + 1 WHERE id = %s",
+                (config_id,)
+            )
+        
+        logging.info(f"Feedback saved for config_id {config_id}, user_id {user_id}, worked: {worked}, operator: {operator}")
+        return True
+    except Exception as e:
+        logging.error(f"Error saving config feedback: {e}")
+        return False
+
+def calculate_success_rate(config_data):
+    total = config_data['successful_count'] + config_data['unsuccessful_count']
+    if total == 0:
+        return 0
+    return round((config_data['successful_count'] / total) * 100, 1)
+
+def get_operator_stats(config_data):
+    total_success = config_data['successful_count']
+    if total_success == 0:
+        return "هیچ بازخورد موفقی ثبت نشده است."
+    
+    stats = []
+    operators = [
+        ("همراه اول", config_data['mci_success']),
+        ("ایرانسل", config_data['mtn_success']),
+        ("رایتل", config_data['rightel_success']),
+        ("مخابرات", config_data['mokhaberat_success']),
+        ("شاتل", config_data['shatel_success']),
+        ("سامانتل", config_data['samantel_success'])
+    ]
+    
+    for operator_name, operator_count in operators:
+        if operator_count > 0:
+            percentage = round((operator_count / total_success) * 100, 1)
+            stats.append(f"{percentage}% کاربران روی {operator_name}✅")
+    
+    return "\n".join(stats) if stats else "هیچ بازخورد اپراتوری ثبت نشده است."
 
 # ---------- تابع برای حذف کامل کاربر از دیتابیس ----------
 async def remove_user_from_db(user_id):
@@ -1046,6 +1315,7 @@ async def debug_subscriptions(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 # ---------- وضعیت کاربر در مموری ----------
 user_states = {}
+config_states = {}  # برای ذخیره وضعیت کانفیگ‌های در حال پردازش
 
 def generate_coupon_code(length=8):
     return ''.join(random.choices(string.ascii_uppercase + string.digits, k=length))
@@ -1152,6 +1422,103 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
         else:
             await update.message.reply_text("⚠️ لطفا یک فایل بکاپ ارسال کنید.", reply_markup=get_back_keyboard())
+            return
+
+    # پردازش کانفیگ‌های رایگان
+    if user_states.get(user_id) == "awaiting_config_file":
+        if update.message.document:
+            try:
+                # دریافت اطلاعات فایل
+                file = update.message.document
+                file_id = file.file_id
+                file_name = file.file_name or "کانفیگ.v2ray"
+                file_size = file.file_size or 0
+                mime_type = file.mime_type or "application/octet-stream"
+                
+                # ذخیره در دیتابیس
+                config_id = await save_free_config(file_id, file_name, file_size, mime_type, user_id)
+                
+                if config_id:
+                    await update.message.reply_text("✅ فایل ثبت شد و برای بررسی به ادمین ارسال شد.", reply_markup=get_free_configs_keyboard())
+                    
+                    # ارسال به ادمین برای تایید
+                    caption = f"📤 فایل کانفیگ جدید از کاربر {user_id} (@{update.effective_user.username or 'NoUsername'})\n"
+                    caption += f"📁 نام فایل: {file_name}\n"
+                    caption += f"📊 حجم: {file_size} بایت\n"
+                    
+                    keyboard = InlineKeyboardMarkup([
+                        [
+                            InlineKeyboardButton("✅ تایید", callback_data=f"approve_config_{config_id}"),
+                            InlineKeyboardButton("❌ رد", callback_data=f"reject_config_{config_id}")
+                        ]
+                    ])
+                    
+                    if mime_type.startswith("text/"):
+                        # اگر فایل متنی است، محتوا را بخوان
+                        try:
+                            temp_file = await file.download_as_bytearray()
+                            content = temp_file.decode('utf-8', errors='ignore')
+                            if len(content) > 500:
+                                content = content[:500] + "..."
+                            caption += f"\n📝 نمونه محتوا:\n```\n{content}\n```"
+                        except:
+                            pass
+                    
+                    await context.bot.send_document(
+                        chat_id=ADMIN_ID,
+                        document=file_id,
+                        caption=caption,
+                        parse_mode="Markdown",
+                        reply_markup=keyboard
+                    )
+                else:
+                    await update.message.reply_text("⚠️ خطا در ثبت فایل. لطفا دوباره تلاش کنید.", reply_markup=get_free_configs_keyboard())
+                    
+            except Exception as e:
+                logging.error(f"Error processing config file: {e}")
+                await update.message.reply_text("⚠️ خطا در پردازش فایل. لطفا دوباره تلاش کنید.", reply_markup=get_free_configs_keyboard())
+        else:
+            await update.message.reply_text("⚠️ لطفا فایل کانفیگ را به صورت فایل ارسال کنید.", reply_markup=get_free_configs_keyboard())
+        
+        user_states.pop(user_id, None)
+        return
+    
+    # پردازش بازخورد کانفیگ
+    if user_states.get(user_id) == "awaiting_config_feedback":
+        if text == "کار کرد✅":
+            user_states[user_id] = "awaiting_operator_selection"
+            await update.message.reply_text("📶 با کدام اپراتور وصل شدید؟", reply_markup=get_operator_keyboard())
+            return
+        elif text == "کار نکرد❌":
+            # ذخیره بازخورد ناموفق
+            if 'current_config_id' in context.user_data:
+                config_id = context.user_data['current_config_id']
+                await save_config_feedback(config_id, user_id, False)
+                del context.user_data['current_config_id']
+            
+            await update.message.reply_text("❌ بازخورد شما ثبت شد.", reply_markup=get_free_configs_keyboard())
+            user_states.pop(user_id, None)
+            return
+        else:
+            await update.message.reply_text("⚠️ لطفا یکی از گزینه‌های بالا را انتخاب کنید.", reply_markup=get_feedback_keyboard())
+            return
+    
+    # پردازش انتخاب اپراتور
+    if user_states.get(user_id) == "awaiting_operator_selection":
+        valid_operators = ["همراه اول", "ایرانسل", "رایتل", "مخابرات", "شاتل", "سامانتل"]
+        
+        if text in valid_operators:
+            # ذخیره بازخورد موفق
+            if 'current_config_id' in context.user_data:
+                config_id = context.user_data['current_config_id']
+                await save_config_feedback(config_id, user_id, True, text)
+                del context.user_data['current_config_id']
+            
+            await update.message.reply_text("✅ ثبت شد.", reply_markup=get_free_configs_keyboard())
+            user_states.pop(user_id, None)
+            return
+        else:
+            await update.message.reply_text("⚠️ لطفا یکی از اپراتورهای بالا را انتخاب کنید.", reply_markup=get_operator_keyboard())
             return
 
     # بررسی وضعیت‌های خاص کاربر
@@ -1760,9 +2127,73 @@ async def handle_normal_commands(update, context, user_id, text):
     # پاک کردن وضعیت قبلی کاربر وقتی از منوی اصلی استفاده می‌کند
     if text in [
         "💰 موجودی", "💳 خرید اشتراک", "🎁 اشتراک تست رایگان", "☎️ پشتیبانی",
-        "💵 اعتبار رایگان", "📂 اشتراک‌های من", "💡 راهنمای اتصال", "🧑‍💼 درخواست نمایندگی"
+        "💵 اعتبار رایگان", "📂 اشتراک‌های من", "💡 راهنمای اتصال", "🧑‍💼 درخواست نمایندگی",
+        "🇮🇷 کانفیگ های رایگان مردم"
     ]:
         user_states.pop(user_id, None)
+    
+    if text == "🇮🇷 کانفیگ های رایگان مردم":
+        await update.message.reply_text(
+            "🇮🇷 بخش کانفیگ‌های رایگان مردمی\n\n"
+            "در این بخش می‌توانید کانفیگ‌های رایگان که توسط کاربران ارسال شده را دریافت کنید "
+            "یا کانفیگ متصل خود را برای استفاده دیگران ارسال کنید.\n\n"
+            "یک گزینه را انتخاب کنید:",
+            reply_markup=get_free_configs_keyboard()
+        )
+        return
+    
+    if text == "📥 دریافت کانفیگ":
+        config_data = await get_random_approved_config(user_id)
+        
+        if not config_data:
+            await update.message.reply_text(
+                "⚠️ هنوز کانفیگ جدیدی ثبت نشده رفیق!\n\n"
+                "در حال حاضر همه کانفیگ‌ها را دریافت کرده‌اید یا کانفیگ تایید شده‌ای موجود نیست.",
+                reply_markup=get_free_configs_keyboard()
+            )
+            return
+        
+        # محاسبه درصد موفقیت
+        success_rate = calculate_success_rate(config_data)
+        operator_stats = get_operator_stats(config_data)
+        
+        caption = f"📁 کانفیگ رایگان\n\n"
+        caption += f"📊 آمار این کانفیگ:\n"
+        caption += f"درصد موفقیت: {success_rate}%✅\n"
+        caption += f"{operator_stats}\n"
+        caption += f"📥 تعداد دانلود: {config_data['download_count']} بار\n\n"
+        caption += "⚠️ توجه: این کانفیگ توسط کاربران ارسال شده و تیم تیز VPN مسئولیتی ندارد.\n"
+        caption += "بعد از تست، کارکرد آن را اعلام کنید."
+        
+        try:
+            # ارسال فایل کانفیگ
+            await context.bot.send_document(
+                chat_id=user_id,
+                document=config_data['file_id'],
+                caption=caption,
+                reply_markup=get_feedback_keyboard()
+            )
+            
+            # ذخیره ID کانفیگ فعلی برای بازخورد
+            context.user_data['current_config_id'] = config_data['id']
+            user_states[user_id] = "awaiting_config_feedback"
+            
+        except Exception as e:
+            logging.error(f"Error sending config file: {e}")
+            await update.message.reply_text(
+                "⚠️ خطا در ارسال کانفیگ. لطفا دوباره تلاش کنید.",
+                reply_markup=get_free_configs_keyboard()
+            )
+        return
+    
+    if text == "📤 ارسال کانفیگ":
+        await update.message.reply_text(
+            "📤 لطفا فایل کانفیگ متصلت رو بفرست\n\n"
+            "⚠️ توجه: فقط فایل کانفیگ قبول میشه. متن، عکس و سایر فایل‌ها پذیرفته نمی‌شوند.",
+            reply_markup=get_back_keyboard()
+        )
+        user_states[user_id] = "awaiting_config_file"
+        return
     
     if text == "💰 موجودی":
         await update.message.reply_text("💰 بخش موجودی:\nیک گزینه را انتخاب کنید:", reply_markup=get_balance_keyboard())
@@ -2211,6 +2642,30 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
         await query.message.reply_text("لطفا کانفیگ را ارسال کنید.")
         user_states[ADMIN_ID] = f"awaiting_config_{payment_id}"
     
+    elif data.startswith("approve_config_"):
+        config_id = int(data.split("_")[-1])
+        config = await db_execute("SELECT file_id, uploaded_by FROM free_configs WHERE id = %s", (config_id,), fetchone=True)
+        if not config:
+            await query.message.reply_text("⚠️ کانفیگ یافت نشد.")
+            return
+        
+        file_id, uploaded_by = config
+        success = await approve_free_config(config_id, ADMIN_ID)
+        if success:
+            await query.message.edit_reply_markup(None)
+            await query.message.reply_text("✅ کانفیگ تایید شد و به بخش کانفیگ‌های رایگان اضافه شد.")
+        else:
+            await query.message.reply_text("⚠️ خطا در تایید کانفیگ.")
+    
+    elif data.startswith("reject_config_"):
+        config_id = int(data.split("_")[-1])
+        success = await reject_free_config(config_id)
+        if success:
+            await query.message.edit_reply_markup(None)
+            await query.message.reply_text("❌ کانفیگ رد شد.")
+        else:
+            await query.message.reply_text("⚠️ خطا در رد کانفیگ.")
+    
     elif data == "admin_balance_action":
         await query.message.reply_text("🆔 ایدی عددی کاربر را وارد کنید:")
         user_states[ADMIN_ID] = "awaiting_admin_user_id_for_balance"
@@ -2291,7 +2746,8 @@ async def on_startup():
                      f"🌐 وب‌هوک: {RENDER_BASE_URL}\n\n"
                      "🆕 قابلیت‌های جدید:\n"
                      "1️⃣ دستور `/remove_user` برای حذف کاربران\n"
-                     "2️⃣ اطلاع‌رسانی خودکار کاربران جدید به ادمین"
+                     "2️⃣ اطلاع‌رسانی خودکار کاربران جدید به ادمین\n"
+                     "3️⃣ بخش کانفیگ‌های رایگان مردمی 🇮🇷"
             )
         except Exception as e:
             logging.error(f"Error sending startup message to admin: {e}")
