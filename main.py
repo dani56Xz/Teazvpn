@@ -2583,7 +2583,7 @@ async def handle_agency_payment(update, context, user_id, text):
             user_states.pop(user_id, None)
         return
 
-async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     data = query.data
     await query.answer()
@@ -2713,7 +2713,7 @@ application.add_handler(CommandHandler("backup", backup_command))
 application.add_handler(CommandHandler("restore", restore_command))
 application.add_handler(CommandHandler("remove_user", remove_user_command))
 application.add_handler(MessageHandler(filters.ALL & (~filters.COMMAND), message_handler))
-application.add_handler(CallbackQueryHandler(admin_callback_handler))
+application.add_handler(CallbackQueryHandler(callback_query_handler))
 
 # ---------- webhook endpoint ----------
 @app.post(WEBHOOK_PATH)
