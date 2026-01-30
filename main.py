@@ -1429,7 +1429,61 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # پردازش کانفیگ‌های رایگان
     if user_states.get(user_id) == "awaiting_config_file":
-        await handle_config_files(update, context, user_id)
+        if update.message.document:
+            try:
+                # دریافت اطلاعات فایل
+                file = update.message.document
+                file_id = file.file_id
+                file_name = file.file_name or "کانفیگ.v2ray"
+                file_size = file.file_size or 0
+                mime_type = file.mime_type or "application/octet-stream"
+                
+                # ذخیره در دیتابیس
+                config_id = await save_free_config(file_id, file_name, file_size, mime_type, user_id)
+                
+                if config_id:
+                    await update.message.reply_text("✅ فایل ثبت شد و برای بررسی به ادمین ارسال شد.", reply_markup=get_free_configs_keyboard())
+                    
+                    # ارسال به ادمین برای تایید
+                    caption = f"📤 فایل کانفیگ جدید از کاربر {user_id} (@{update.effective_user.username or 'NoUsername'})\n"
+                    caption += f"📁 نام فایل: {file_name}\n"
+                    caption += f"📊 حجم: {file_size} بایت\n"
+                    
+                    keyboard = InlineKeyboardMarkup([
+                        [
+                            InlineKeyboardButton("✅ تایید", callback_data=f"approve_config_{config_id}"),
+                            InlineKeyboardButton("❌ رد", callback_data=f"reject_config_{config_id}")
+                        ]
+                    ])
+                    
+                    if mime_type.startswith("text/"):
+                        # اگر فایل متنی است، محتوا را بخوان
+                        try:
+                            temp_file = await file.download_as_bytearray()
+                            content = temp_file.decode('utf-8', errors='ignore')
+                            if len(content) > 500:
+                                content = content[:500] + "..."
+                            caption += f"\n📝 نمونه محتوا:\n```\n{content}\n```"
+                        except:
+                            pass
+                    
+                    await context.bot.send_document(
+                        chat_id=ADMIN_ID,
+                        document=file_id,
+                        caption=caption,
+                        parse_mode="Markdown",
+                        reply_markup=keyboard
+                    )
+                else:
+                    await update.message.reply_text("⚠️ خطا در ثبت فایل. لطفا دوباره تلاش کنید.", reply_markup=get_free_configs_keyboard())
+                    
+            except Exception as e:
+                logging.error(f"Error processing config file: {e}")
+                await update.message.reply_text("⚠️ خطا در پردازش فایل. لطفا دوباره تلاش کنید.", reply_markup=get_free_configs_keyboard())
+        else:
+            await update.message.reply_text("⚠️ لطفا فایل کانفیگ را به صورت فایل ارسال کنید.", reply_markup=get_free_configs_keyboard())
+        
+        user_states.pop(user_id, None)
         return
     
     # پردازش بازخورد کانفیگ
@@ -1568,129 +1622,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # اگر کاربر در هیچ وضعیت خاصی نباشد، دستورات معمولی را پردازش کن
     await handle_normal_commands(update, context, user_id, text)
 
-async def handle_config_files(update, context, user_id):
-    """پردازش فایل‌های کانفیگ ارسال شده توسط کاربر"""
-    try:
-        # بررسی اگر کاربر فایل‌های متعدد ارسال کرده است
-        document = update.message.document
-        photo = update.message.photo
-        
-        config_files = []
-        
-        # اگر فایل داکیومنت است
-        if document:
-            file_id = document.file_id
-            file_name = document.file_name or "کانفیگ.v2ray"
-            file_size = document.file_size or 0
-            mime_type = document.mime_type or "application/octet-stream"
-            
-            # بررسی آیا فایل کانفیگ است
-            if (file_name.endswith('.v2ray') or file_name.endswith('.txt') or 
-                file_name.endswith('.json') or 'v2ray' in file_name.lower() or
-                'config' in file_name.lower()):
-                config_files.append({
-                    'type': 'document',
-                    'file_id': file_id,
-                    'file_name': file_name,
-                    'file_size': file_size,
-                    'mime_type': mime_type
-                })
-        
-        # اگر عکس است (ممکن است اسکرین‌شات از کانفیگ باشد)
-        if photo:
-            # بزرگترین سایز عکس را انتخاب کن
-            file_id = photo[-1].file_id
-            config_files.append({
-                'type': 'photo',
-                'file_id': file_id,
-                'file_name': f"config_photo_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg",
-                'file_size': 0,
-                'mime_type': 'image/jpeg'
-            })
-        
-        if not config_files:
-            await update.message.reply_text(
-                "⚠️ فایل ارسال شده معتبر نیست. لطفا فایل کانفیگ (با پسوند .v2ray, .txt, .json) یا عکس از کانفیگ ارسال کنید.",
-                reply_markup=get_free_configs_keyboard()
-            )
-            user_states.pop(user_id, None)
-            return
-        
-        # پردازش هر فایل به صورت جداگانه
-        saved_configs = []
-        for config in config_files:
-            # ذخیره در دیتابیس
-            config_id = await save_free_config(
-                config['file_id'],
-                config['file_name'],
-                config['file_size'],
-                config['mime_type'],
-                user_id
-            )
-            
-            if config_id:
-                saved_configs.append((config_id, config))
-                logging.info(f"Config file saved: {config['file_name']} with ID: {config_id}")
-        
-        if saved_configs:
-            total_saved = len(saved_configs)
-            await update.message.reply_text(
-                f"✅ {total_saved} فایل ثبت شد و برای بررسی به ادمین ارسال شد.",
-                reply_markup=get_free_configs_keyboard()
-            )
-            
-            # ارسال هر فایل به صورت جداگانه به ادمین برای تایید
-            for config_id, config in saved_configs:
-                caption = f"📤 فایل کانفیگ جدید از کاربر {user_id} (@{update.effective_user.username or 'NoUsername'})\n"
-                caption += f"📁 نام فایل: {config['file_name']}\n"
-                caption += f"📊 حجم: {config['file_size']} بایت\n"
-                caption += f"📝 نوع: {config['type']}\n"
-                caption += f"🆔 کد فایل: {config_id}"
-                
-                keyboard = InlineKeyboardMarkup([
-                    [
-                        InlineKeyboardButton("✅ تایید", callback_data=f"approve_config_{config_id}"),
-                        InlineKeyboardButton("❌ رد", callback_data=f"reject_config_{config_id}")
-                    ]
-                ])
-                
-                try:
-                    if config['type'] == 'document':
-                        await context.bot.send_document(
-                            chat_id=ADMIN_ID,
-                            document=config['file_id'],
-                            caption=caption,
-                            parse_mode="Markdown",
-                            reply_markup=keyboard
-                        )
-                    elif config['type'] == 'photo':
-                        await context.bot.send_photo(
-                            chat_id=ADMIN_ID,
-                            photo=config['file_id'],
-                            caption=caption,
-                            parse_mode="Markdown",
-                            reply_markup=keyboard
-                        )
-                    
-                    logging.info(f"Config {config_id} sent to admin for approval")
-                except Exception as e:
-                    logging.error(f"Error sending config {config_id} to admin: {e}")
-        else:
-            await update.message.reply_text(
-                "⚠️ خطا در ثبت فایل‌ها. لطفا دوباره تلاش کنید.",
-                reply_markup=get_free_configs_keyboard()
-            )
-        
-        user_states.pop(user_id, None)
-        
-    except Exception as e:
-        logging.error(f"Error processing config files: {e}")
-        await update.message.reply_text(
-            "⚠️ خطا در پردازش فایل‌ها. لطفا دوباره تلاش کنید.",
-            reply_markup=get_free_configs_keyboard()
-        )
-        user_states.pop(user_id, None)
-
 async def handle_remove_user(update, context, user_id, text):
     """پردازش حذف کاربر"""
     try:
@@ -1746,10 +1677,7 @@ async def process_payment_receipt(update, context, user_id, payment_id, receipt_
         ])
 
         if update.message.photo:
-            # اگر کاربر چندین عکس ارسال کرده باشد
-            photos = update.message.photo
-            # بزرگترین سایز عکس را انتخاب کن
-            file_id = photos[-1].file_id
+            file_id = update.message.photo[-1].file_id
             await context.bot.send_photo(chat_id=ADMIN_ID, photo=file_id, caption=caption, reply_markup=keyboard)
         elif update.message.document:
             doc_id = update.message.document.file_id
@@ -1782,24 +1710,8 @@ async def process_config(update, context, user_id, payment_id):
                 parse_mode="Markdown"
             )
             await update.message.reply_text("✅ کانفیگ با موفقیت به خریدار ارسال شد.", reply_markup=get_main_keyboard())
-        elif update.message.document:
-            # اگر ادمین فایل کانفیگ ارسال کرد
-            document = update.message.document
-            file_id = document.file_id
-            file_name = document.file_name or "config.v2ray"
-            
-            # ارسال فایل به کاربر
-            await context.bot.send_document(
-                chat_id=buyer_id,
-                document=file_id,
-                caption=f"✅ کانفیگ اشتراک شما ({description})\nکد خرید: #{payment_id}\nفایل: {file_name}"
-            )
-            
-            # ذخیره file_id در دیتابیس به عنوان کانفیگ
-            await update_subscription_config(payment_id, f"FILE:{file_id}")
-            await update.message.reply_text("✅ فایل کانفیگ با موفقیت به خریدار ارسال شد.", reply_markup=get_main_keyboard())
         else:
-            await update.message.reply_text("⚠️ لطفا کانفیگ را به صورت متن یا فایل ارسال کنید.", reply_markup=get_back_keyboard())
+            await update.message.reply_text("⚠️ لطفا کانفیگ را به صورت متن ارسال کنید.", reply_markup=get_back_keyboard())
             
     except Exception as e:
         logging.error(f"Error processing config: {e}")
@@ -2892,8 +2804,7 @@ async def on_startup():
                      "🆕 قابلیت‌های جدید:\n"
                      "1️⃣ دستور `/remove_user` برای حذف کاربران\n"
                      "2️⃣ اطلاع‌رسانی خودکار کاربران جدید به ادمین\n"
-                     "3️⃣ بخش کانفیگ‌های رایگان مردمی 🇮🇷\n"
-                     "4️⃣ پشتیبانی از ارسال چندین فایل کانفیگ همزمان"
+                     "3️⃣ بخش کانفیگ‌های رایگان مردمی 🇮🇷"
             )
         except Exception as e:
             logging.error(f"Error sending startup message to admin: {e}")
