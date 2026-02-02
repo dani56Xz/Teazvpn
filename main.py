@@ -433,6 +433,7 @@ async def user_info_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("📂 هیچ کاربری یافت نشد.")
             return
 
+        # ایجاد دکمه‌های اینلاین برای اقدامات ادمین
         inline_kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("💰 افزایش/کاهش موجودی", callback_data="admin_balance_action")],
             [InlineKeyboardButton("🧑‍💼 تغییر نوع اکانت", callback_data="admin_agent_action")],
@@ -485,7 +486,7 @@ async def user_info_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await context.bot.send_message(
                     chat_id=ADMIN_ID,
                     text=part,
-                    reply_markup=inline_kb if i == 0 else None
+                    reply_markup=inline_kb
                 )
             else:
                 await context.bot.send_message(chat_id=ADMIN_ID, text=part)
@@ -1012,7 +1013,6 @@ async def debug_subscriptions(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 # ---------- وضعیت کاربر در مموری ----------
 user_states = {}
-config_states = {}
 
 def generate_coupon_code(length=8):
     return ''.join(random.choices(string.ascii_uppercase + string.digits, k=length))
@@ -1114,7 +1114,50 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("⚠️ لطفا یک فایل بکاپ ارسال کنید.", reply_markup=get_back_keyboard())
             return
 
-    # پردازش فیش پرداخت
+    # پردازش کد تخفیف توسط کاربر عادی
+    if state and state.startswith("awaiting_coupon_code_"):
+        await handle_coupon_code(update, context, user_id, state, text)
+        return
+
+    # پردازش اطلاع‌رسانی توسط ادمین
+    elif state == "awaiting_notification_type" and user_id == ADMIN_ID:
+        await handle_notification_type(update, context, user_id, text)
+        return
+    
+    elif state == "awaiting_notification_target_user" and user_id == ADMIN_ID:
+        await handle_notification_target_user(update, context, user_id, text)
+        return
+    
+    elif (state in ["awaiting_notification_text_all", "awaiting_notification_text_agents"] or 
+          (state and state.startswith("awaiting_notification_text_single_"))):
+        await handle_notification_text(update, context, user_id, state, text)
+        return
+    
+    elif state and state.startswith("confirm_notification_") and user_id == ADMIN_ID:
+        await handle_confirm_notification(update, context, user_id, state, text)
+        return
+
+    # هندلرهای ادمین برای user_info
+    elif state == "awaiting_admin_user_id_for_balance" and user_id == ADMIN_ID:
+        await handle_admin_balance_user(update, context, user_id, text)
+        return
+    
+    elif state and state.startswith("awaiting_balance_amount_") and user_id == ADMIN_ID:
+        await handle_admin_balance_amount(update, context, user_id, state, text)
+        return
+    
+    elif state == "awaiting_admin_user_id_for_agent" and user_id == ADMIN_ID:
+        await handle_admin_agent_user(update, context, user_id, text)
+        return
+    
+    elif state and state.startswith("awaiting_agent_type_") and user_id == ADMIN_ID:
+        await handle_admin_agent_type(update, context, user_id, state, text)
+        return
+
+    # بررسی وضعیت‌های خاص کاربر
+    state = user_states.get(user_id)
+    
+    # پردازش وضعیت‌های مربوط به فیش پرداخت
     if state and state.startswith("awaiting_deposit_receipt_"):
         payment_id = int(state.split("_")[-1])
         await process_payment_receipt(update, context, user_id, payment_id, "deposit")
@@ -1164,46 +1207,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     elif state and state.startswith("awaiting_coupon_percent_") and user_id == ADMIN_ID:
         await handle_coupon_percent(update, context, user_id, state, text)
-        return
-
-    # پردازش کد تخفیف توسط کاربر عادی
-    elif state and state.startswith("awaiting_coupon_code_"):
-        await handle_coupon_code(update, context, user_id, state, text)
-        return
-
-    # پردازش اطلاع‌رسانی توسط ادمین
-    elif state == "awaiting_notification_type" and user_id == ADMIN_ID:
-        await handle_notification_type(update, context, user_id, text)
-        return
-    
-    elif state == "awaiting_notification_target_user" and user_id == ADMIN_ID:
-        await handle_notification_target_user(update, context, user_id, text)
-        return
-    
-    elif (state in ["awaiting_notification_text_all", "awaiting_notification_text_agents"] or 
-          (state and state.startswith("awaiting_notification_text_single_"))):
-        await handle_notification_text(update, context, user_id, state, text)
-        return
-    
-    elif state and state.startswith("confirm_notification_") and user_id == ADMIN_ID:
-        await handle_confirm_notification(update, context, user_id, state, text)
-        return
-
-    # هندلرهای ادمین برای user_info
-    elif state == "awaiting_admin_user_id_for_balance" and user_id == ADMIN_ID:
-        await handle_admin_balance_user(update, context, user_id, text)
-        return
-    
-    elif state and state.startswith("awaiting_balance_amount_") and user_id == ADMIN_ID:
-        await handle_admin_balance_amount(update, context, user_id, state, text)
-        return
-    
-    elif state == "awaiting_admin_user_id_for_agent" and user_id == ADMIN_ID:
-        await handle_admin_agent_user(update, context, user_id, text)
-        return
-    
-    elif state and state.startswith("awaiting_agent_type_") and user_id == ADMIN_ID:
-        await handle_admin_agent_type(update, context, user_id, state, text)
         return
 
     # اگر کاربر در هیچ وضعیت خاصی نباشد، دستورات معمولی را پردازش کن
@@ -1727,7 +1730,7 @@ async def handle_normal_commands(update, context, user_id, text):
         return
 
     if text == "افزایش موجودی":
-        await update.message.reply_text("💳 لطفا مبلغ واریزی را به تومان وارد کنید (مثال: 140000):", reply_markup=get_back_keyboard())
+        await update.message.reply_text("💳 لطفا مبلغ واریزی را به تومان وارد کنید (مثال: 90000):", reply_markup=get_back_keyboard())
         user_states[user_id] = "awaiting_deposit_amount"
         return
 
@@ -1864,7 +1867,7 @@ async def handle_normal_commands(update, context, user_id, text):
             success = await remove_user_from_db(target_user_id)
             if success:
                 await update.message.reply_text(
-                    f"✅ کاربر با ایدی {target_user_id} به طور کامل از دیتابیس حذف شد.",
+                    f"✅ کاربر با ایدی {target_user_id} به طور کامل از دیتابی حذف شد.",
                     reply_markup=get_main_keyboard()
                 )
             else:
@@ -2269,10 +2272,10 @@ async def on_startup():
                      f"⏰ زمان: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
                      f"🌐 وب‌هوک: {RENDER_BASE_URL}\n\n"
                      "🆕 تغییرات اعمال شده:\n"
-                     "1️⃣ حذف بخش کانفیگ‌های رایگان مردمی 🇮🇷\n"
-                     "2️⃣ به‌روزرسانی قیمت‌ها\n"
-                     "3️⃣ بهبود دستور `/user_info` با دکمه‌های مدیریت\n"
-                     "4️⃣ به‌روزرسانی بخش نمایندگی"
+                     "1️⃣ حذف بخش کانفیگ‌های رایگان مردم\n"
+                     "2️⃣ بازگشت دکمه‌های مدیریتی در /user_info\n"
+                     "3️⃣ به‌روزرسانی قیمت‌ها به جدیدترین نسخه\n"
+                     "4️⃣ به‌روزرسانی متن درخواست نمایندگی"
             )
         except Exception as e:
             logging.error(f"Error sending startup message to admin: {e}")
