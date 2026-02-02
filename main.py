@@ -21,7 +21,7 @@ from psycopg2 import pool
 TOKEN = os.getenv("BOT_TOKEN")
 CHANNEL_USERNAME = "@teazvpn"
 ADMIN_ID = 5542927340
-TRON_ADDRESS = "TQxhiwDREd8rxZuyDWx3auxcpzjSi1mAJG"
+TRON_ADDRESS = "TJ4xrwKzKjk6FgKfuuqwah3Az5Ur22kJb"
 BANK_CARD = "6037 9975 9717 2684"
 
 RENDER_BASE_URL = os.getenv("RENDER_EXTERNAL_URL") or os.getenv("RAILWAY_STATIC_URL") or "https://teazvpn.railway.app"
@@ -1114,46 +1114,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("⚠️ لطفا یک فایل بکاپ ارسال کنید.", reply_markup=get_back_keyboard())
             return
 
-    # پردازش کد تخفیف توسط کاربر عادی
-    if state and state.startswith("awaiting_coupon_code_"):
-        await handle_coupon_code(update, context, user_id, state, text)
-        return
-
-    # پردازش اطلاع‌رسانی توسط ادمین
-    elif state == "awaiting_notification_type" and user_id == ADMIN_ID:
-        await handle_notification_type(update, context, user_id, text)
-        return
-    
-    elif state == "awaiting_notification_target_user" and user_id == ADMIN_ID:
-        await handle_notification_target_user(update, context, user_id, text)
-        return
-    
-    elif (state in ["awaiting_notification_text_all", "awaiting_notification_text_agents"] or 
-          (state and state.startswith("awaiting_notification_text_single_"))):
-        await handle_notification_text(update, context, user_id, state, text)
-        return
-    
-    elif state and state.startswith("confirm_notification_") and user_id == ADMIN_ID:
-        await handle_confirm_notification(update, context, user_id, state, text)
-        return
-
-    # هندلرهای ادمین برای user_info
-    elif state == "awaiting_admin_user_id_for_balance" and user_id == ADMIN_ID:
-        await handle_admin_balance_user(update, context, user_id, text)
-        return
-    
-    elif state and state.startswith("awaiting_balance_amount_") and user_id == ADMIN_ID:
-        await handle_admin_balance_amount(update, context, user_id, state, text)
-        return
-    
-    elif state == "awaiting_admin_user_id_for_agent" and user_id == ADMIN_ID:
-        await handle_admin_agent_user(update, context, user_id, text)
-        return
-    
-    elif state and state.startswith("awaiting_agent_type_") and user_id == ADMIN_ID:
-        await handle_admin_agent_type(update, context, user_id, state, text)
-        return
-
     # بررسی وضعیت‌های خاص کاربر
     state = user_states.get(user_id)
     
@@ -1207,6 +1167,46 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     elif state and state.startswith("awaiting_coupon_percent_") and user_id == ADMIN_ID:
         await handle_coupon_percent(update, context, user_id, state, text)
+        return
+
+    # پردازش کد تخفیف توسط کاربر عادی
+    elif state and state.startswith("awaiting_coupon_code_"):
+        await handle_coupon_code(update, context, user_id, state, text)
+        return
+
+    # پردازش اطلاع‌رسانی توسط ادمین
+    elif state == "awaiting_notification_type" and user_id == ADMIN_ID:
+        await handle_notification_type(update, context, user_id, text)
+        return
+    
+    elif state == "awaiting_notification_target_user" and user_id == ADMIN_ID:
+        await handle_notification_target_user(update, context, user_id, text)
+        return
+    
+    elif (state in ["awaiting_notification_text_all", "awaiting_notification_text_agents"] or 
+          (state and state.startswith("awaiting_notification_text_single_"))):
+        await handle_notification_text(update, context, user_id, state, text)
+        return
+    
+    elif state and state.startswith("confirm_notification_") and user_id == ADMIN_ID:
+        await handle_confirm_notification(update, context, user_id, state, text)
+        return
+
+    # هندلرهای ادمین برای user_info
+    elif state == "awaiting_admin_user_id_for_balance" and user_id == ADMIN_ID:
+        await handle_admin_balance_user(update, context, user_id, text)
+        return
+    
+    elif state and state.startswith("awaiting_balance_amount_") and user_id == ADMIN_ID:
+        await handle_admin_balance_amount(update, context, user_id, state, text)
+        return
+    
+    elif state == "awaiting_admin_user_id_for_agent" and user_id == ADMIN_ID:
+        await handle_admin_agent_user(update, context, user_id, text)
+        return
+    
+    elif state and state.startswith("awaiting_agent_type_") and user_id == ADMIN_ID:
+        await handle_admin_agent_type(update, context, user_id, state, text)
         return
 
     # اگر کاربر در هیچ وضعیت خاصی نباشد، دستورات معمولی را پردازش کن
@@ -2275,7 +2275,8 @@ async def on_startup():
                      "1️⃣ حذف بخش کانفیگ‌های رایگان مردم\n"
                      "2️⃣ بازگشت دکمه‌های مدیریتی در /user_info\n"
                      "3️⃣ به‌روزرسانی قیمت‌ها به جدیدترین نسخه\n"
-                     "4️⃣ به‌روزرسانی متن درخواست نمایندگی"
+                     "4️⃣ به‌روزرسانی متن درخواست نمایندگی\n"
+                     "5️⃣ رفع خطای UnboundLocalError"
             )
         except Exception as e:
             logging.error(f"Error sending startup message to admin: {e}")
