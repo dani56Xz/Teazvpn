@@ -2279,7 +2279,8 @@ async def on_startup():
                      "2️⃣ بازگشت دکمه‌های مدیریتی در /user_info\n"
                      "3️⃣ به‌روزرسانی قیمت‌ها به جدیدترین نسخه\n"
                      "4️⃣ به‌روزرسانی متن درخواست نمایندگی\n"
-                     "5️⃣ رفع خطای UnboundLocalError"
+                     "5️⃣ رفع خطای UnboundLocalError\n"
+                     "6️⃣ رفع مشکل عدم نمایش دکمه ارسال کانفیگ"
             )
         except Exception as e:
             logging.error(f"Error sending startup message to admin: {e}")
