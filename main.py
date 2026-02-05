@@ -2134,16 +2134,16 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
                 await query.edit_message_reply_markup(None)
                 await query.edit_message_text("✅ پرداخت تایید شد.")
             
-        elif ptype == "buy_subscription":
-    await context.bot.send_message(user_id, f"✅ پرداخت تایید شد. اشتراک شما (کد خرید: #{payment_id}) ارسال خواهد شد.")
-    config_keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🟣 ارسال کانفیگ", callback_data=f"send_config_{payment_id}")]
-    ])
-    # ویرایش پیام فعلی با کیبورد جدید
-    await query.edit_message_text(
-        f"✅ پرداخت برای اشتراک ({description}) تایید شد.\n\nکد خرید: #{payment_id}\n\nبرای ارسال کانفیگ روی دکمه زیر کلیک کنید:",
-        reply_markup=config_keyboard
-    )
+            elif ptype == "buy_subscription":
+                await context.bot.send_message(user_id, f"✅ پرداخت تایید شد. اشتراک شما (کد خرید: #{payment_id}) ارسال خواهد شد.")
+                config_keyboard = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🟣 ارسال کانفیگ", callback_data=f"send_config_{payment_id}")]
+                ])
+                # ویرایش پیام فعلی با کیبورد جدید
+                await query.edit_message_text(
+                    f"✅ پرداخت برای اشتراک ({description}) تایید شد.\n\nکد خرید: #{payment_id}\n\nبرای ارسال کانفیگ روی دکمه زیر کلیک کنید:",
+                    reply_markup=config_keyboard
+                )
             
             elif ptype == "agency_request":
                 await set_user_agent(user_id)
