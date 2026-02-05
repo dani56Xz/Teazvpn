@@ -2134,7 +2134,7 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
                 await query.edit_message_reply_markup(None)
                 await query.edit_message_text("✅ پرداخت تایید شد.")
             
-            elif ptype == "buy_subscription":
+        elif ptype == "buy_subscription":
     await context.bot.send_message(user_id, f"✅ پرداخت تایید شد. اشتراک شما (کد خرید: #{payment_id}) ارسال خواهد شد.")
     config_keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("🟣 ارسال کانفیگ", callback_data=f"send_config_{payment_id}")]
