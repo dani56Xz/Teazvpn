@@ -22,7 +22,7 @@ TOKEN = os.getenv("BOT_TOKEN")
 CHANNEL_USERNAME = "@teazvpn"
 ADMIN_ID = 5542927340
 TRON_ADDRESS = "TQxhiwDREd8rxZuyDWx3auxcpzjSi1mAJG"
-BANK_CARD = "6037 9975 9717 2684"
+BANK_CARD = "6219 8614 2845 2139"
 
 RENDER_BASE_URL = os.getenv("RENDER_EXTERNAL_URL") or os.getenv("RAILWAY_STATIC_URL") or "https://teazvpn.railway.app"
 WEBHOOK_PATH = f"/webhook/{TOKEN}"
@@ -1742,7 +1742,7 @@ async def handle_normal_commands(update, context, user_id, text):
                 await update.message.reply_text(
                     f"لطفا {amount} تومان واریز کنید و فیش را ارسال کنید:\n\n"
                     f"💎 آدرس کیف پول TRON:\n`{TRON_ADDRESS}`\n\n"
-                    f"یا\n\n🏦 شماره کارت بانکی:\n`{BANK_CARD}`\nفرهنگ",
+                    f"یا\n\n🏦 شماره کارت بانکی:\n`{BANK_CARD}`\nبحق",
                     reply_markup=get_back_keyboard(),
                     parse_mode="MarkdownV2"
                 )
@@ -1905,7 +1905,7 @@ async def handle_payment_method(update, context, user_id, text):
                 await add_subscription(user_id, payment_id, plan)
                 await update.message.reply_text(
                     f"لطفا {amount} تومان واریز کنید و فیش را ارسال کنید:\n\n"
-                    f"🏦 شماره کارت بانکی:\n`{BANK_CARD}`\nفرهنگ",
+                    f"🏦 شماره کارت بانکی:\n`{BANK_CARD}`\nبحق",
                     reply_markup=get_back_keyboard(),
                     parse_mode="MarkdownV2"
                 )
@@ -2053,7 +2053,7 @@ async def handle_agency_payment(update, context, user_id, text):
         if payment_id:
             await update.message.reply_text(
                 f"لطفا {amount} تومان واریز کنید و فیش را ارسال کنید:\n\n"
-                f"🏦 شماره کارت بانکی:\n`{BANK_CARD}`\nفرهنگ",
+                f"🏦 شماره کارت بانکی:\n`{BANK_CARD}`\nبحق",
                 reply_markup=get_back_keyboard(),
                 parse_mode="MarkdownV2"
             )
