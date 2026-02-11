@@ -234,7 +234,7 @@ async def remove_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     """
     حذف کامل کاربر از دیتابیس (فقط برای ادمین)
     """
-    if update.effective_user.id != ADMIN_ID:
+    if not update.effective_user or update.effective_user.id != ADMIN_ID:
         await update.message.reply_text("⚠️ شما اجازه دسترسی به این دستور را ندارید.")
         return
     
@@ -242,7 +242,7 @@ async def remove_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     user_states[update.effective_user.id] = "awaiting_user_id_for_removal"
 
 async def backup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
+    if not update.effective_user or update.effective_user.id != ADMIN_ID:
         await update.message.reply_text("⚠️ شما اجازه دسترسی به این دستور را ندارید.")
         return
     
@@ -327,7 +327,7 @@ async def restore_database_from_backup(file_path: str):
         return False, f"⚠️ خطا در بازیابی دیتابیس: {str(e)}"
 
 async def restore_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
+    if not update.effective_user or update.effective_user.id != ADMIN_ID:
         await update.message.reply_text("⚠️ شما اجازه دسترسی به این دستور را ندارید.")
         return
     
@@ -395,7 +395,7 @@ async def notify_admin_new_user(user_id, username, invited_by=None):
         logging.error(f"Error notifying admin about new user {user_id}: {e}")
 
 async def notification_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
+    if not update.effective_user or update.effective_user.id != ADMIN_ID:
         await update.message.reply_text("⚠️ شما اجازه دسترسی به این دستور را ندارید.")
         return
     
@@ -412,7 +412,7 @@ async def notification_command(update: Update, context: ContextTypes.DEFAULT_TYP
     user_states[update.effective_user.id] = "awaiting_notification_type"
 
 async def coupon_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
+    if not update.effective_user or update.effective_user.id != ADMIN_ID:
         await update.message.reply_text("⚠️ شما اجازه دسترسی به این دستور را ندارید.")
         return
     
@@ -420,7 +420,7 @@ async def coupon_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_states[update.effective_user.id] = "awaiting_coupon_discount"
 
 async def user_info_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
+    if not update.effective_user or update.effective_user.id != ADMIN_ID:
         await update.message.reply_text("⚠️ شما اجازه دسترسی به این دستور را ندارید.")
         return
     
@@ -496,7 +496,7 @@ async def user_info_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ خطایی در نمایش اطلاعات کاربران رخ داد. لطفاً دوباره تلاش کنید.")
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
+    if not update.effective_user or update.effective_user.id != ADMIN_ID:
         await update.message.reply_text("⚠️ شما اجازه دسترسی به این دستور را ندارید.")
         return
     
@@ -601,7 +601,7 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ خطایی در نمایش آمار رخ داد. لطفاً دوباره تلاش کنید.")
 
 async def clear_db(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
+    if not update.effective_user or update.effective_user.id != ADMIN_ID:
         await update.message.reply_text("⚠️ شما اجازه دسترسی به این دستور را ندارید.")
         return
     try:
@@ -971,7 +971,7 @@ async def get_user_subscriptions(user_id):
 
 # ---------- دستور تشخیصی برای ادمین ----------
 async def debug_subscriptions(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
+    if not update.effective_user or update.effective_user.id != ADMIN_ID:
         await update.message.reply_text("⚠️ شما اجازه دسترسی به این دستور را ندارید.")
         return
     try:
@@ -1043,6 +1043,9 @@ async def set_bot_commands():
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
+    if not user:
+        return
+        
     user_id = user.id
     username = user.username or ""
 
@@ -1065,6 +1068,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_states.pop(user_id, None)
 
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # بررسی وجود پیام و کاربر
+    if not update.message or not update.effective_user:
+        logging.info("Received update without message or effective_user, ignoring...")
+        return
+        
     user_id = update.effective_user.id
     text = update.message.text if update.message.text else ""
     
@@ -2110,6 +2118,11 @@ async def handle_agency_payment(update, context, user_id, text):
 async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     data = query.data
+    
+    if not query or not query.from_user:
+        logging.info("Received callback query without from_user, ignoring...")
+        return
+        
     await query.answer()
 
     if update.effective_user.id != ADMIN_ID:
@@ -2239,6 +2252,9 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
             pass
 
 async def start_with_param(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_user:
+        return
+        
     args = context.args
     if args and len(args) > 0:
         try:
@@ -2260,7 +2276,7 @@ application.add_handler(CommandHandler("notification", notification_command))
 application.add_handler(CommandHandler("backup", backup_command))
 application.add_handler(CommandHandler("restore", restore_command))
 application.add_handler(CommandHandler("remove_user", remove_user_command))
-application.add_handler(MessageHandler(filters.ALL & (~filters.COMMAND), message_handler))
+application.add_handler(MessageHandler(filters.ALL & (~filters.COMMAND) & filters.TEXT, message_handler))
 application.add_handler(CallbackQueryHandler(admin_callback_handler))
 
 # ---------- webhook endpoint ----------
@@ -2310,7 +2326,8 @@ async def on_startup():
                      "3️⃣ به‌روزرسانی قیمت‌ها به جدیدترین نسخه\n"
                      "4️⃣ به‌روزرسانی متن درخواست نمایندگی\n"
                      "5️⃣ رفع خطای UnboundLocalError\n"
-                     "6️⃣ رفع مشکل عدم نمایش دکمه ارسال کانفیگ"
+                     "6️⃣ رفع مشکل عدم نمایش دکمه ارسال کانفیگ\n"
+                     "7️⃣ رفع خطای AttributeError: 'NoneType' object has no attribute 'id'"
             )
         except Exception as e:
             logging.error(f"Error sending startup message to admin: {e}")
