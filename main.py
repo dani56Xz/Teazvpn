@@ -969,6 +969,86 @@ async def get_user_subscriptions(user_id):
         logging.error(f"Error in get_user_subscriptions for user_id {user_id}: {e}")
         return []
 
+# ---------- تابع بررسی و اطلاع‌رسانی اشتراک‌های منقضی شده ----------
+async def check_expired_subscriptions(context: ContextTypes.DEFAULT_TYPE):
+    """
+    بررسی اشتراک‌های منقضی شده و ارسال پیام به کاربران
+    این تابع هر ۶ ساعت یکبار اجرا می‌شود
+    """
+    try:
+        current_time = datetime.now()
+        logging.info("Checking for expired subscriptions...")
+        
+        # دریافت اشتراک‌های فعالی که تاریخ انقضای آنها گذشته
+        expired_subs = await db_execute(
+            """
+            SELECT s.id, s.user_id, s.plan, s.start_date, s.duration_days, u.username
+            FROM subscriptions s
+            LEFT JOIN users u ON s.user_id = u.user_id
+            WHERE s.status = 'active' 
+            AND (s.start_date + (s.duration_days || ' days')::interval) < %s
+            """,
+            (current_time,), fetch=True
+        )
+        
+        if not expired_subs:
+            logging.info("No expired subscriptions found.")
+            return
+        
+        expired_count = 0
+        notified_count = 0
+        
+        for sub in expired_subs:
+            sub_id, user_id, plan, start_date, duration_days, username = sub
+            
+            # به‌روزرسانی وضعیت به غیرفعال
+            await db_execute("UPDATE subscriptions SET status = 'inactive' WHERE id = %s", (sub_id,))
+            expired_count += 1
+            
+            # ارسال پیام به کاربر
+            try:
+                message = (
+                    "⏰ **اشتراک شما به پایان رسید!**\n\n"
+                    f"📌 پلن: {plan}\n"
+                    f"📅 تاریخ شروع: {start_date.strftime('%Y-%m-%d')}\n"
+                    f"⏳ مدت: {duration_days} روز\n\n"
+                    "❌ سرویس شما غیرفعال شده است.\n"
+                    "✅ برای ادامه استفاده، لطفا اشتراک جدیدی خریداری کنید.\n\n"
+                    "برای خرید از بخش 💳 خرید اشتراک اقدام کنید."
+                )
+                
+                await context.bot.send_message(
+                    chat_id=user_id,
+                    text=message,
+                    parse_mode="Markdown"
+                )
+                notified_count += 1
+                logging.info(f"Expiration notification sent to user {user_id} for subscription {sub_id}")
+                
+            except Exception as e:
+                logging.error(f"Failed to send expiration notification to user {user_id}: {e}")
+        
+        # گزارش به ادمین
+        if expired_count > 0:
+            admin_message = (
+                f"📊 **گزارش اشتراک‌های منقضی شده**\n\n"
+                f"⏰ زمان بررسی: {current_time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                f"📦 تعداد اشتراک‌های منقضی: {expired_count}\n"
+                f"✅ تعداد اطلاع‌رسانی موفق: {notified_count}\n"
+                f"❌ تعداد ناموفق: {expired_count - notified_count}"
+            )
+            
+            await context.bot.send_message(
+                chat_id=ADMIN_ID,
+                text=admin_message,
+                parse_mode="Markdown"
+            )
+            
+        logging.info(f"Expired subscriptions check completed. Found: {expired_count}, Notified: {notified_count}")
+        
+    except Exception as e:
+        logging.error(f"Error in check_expired_subscriptions: {e}")
+
 # ---------- دستور تشخیصی برای ادمین ----------
 async def debug_subscriptions(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_user or update.effective_user.id != ADMIN_ID:
@@ -977,7 +1057,7 @@ async def debug_subscriptions(update: Update, context: ContextTypes.DEFAULT_TYPE
     try:
         rows = await db_execute(
             """
-            SELECT s.user_id, u.username, s.plan, s.payment_id, s.start_date, s.duration_days, s.status
+            SELECT s.user_id, u.username, s.plan, s.payment_id, s.start_date, s.duration_days, s.status, s.config
             FROM subscriptions s
             LEFT JOIN users u ON s.user_id = u.user_id
             ORDER BY s.status DESC, s.start_date DESC
@@ -991,20 +1071,28 @@ async def debug_subscriptions(update: Update, context: ContextTypes.DEFAULT_TYPE
         response = "📂 لیست تمام اشتراک‌های کاربران:\n\n"
         current_time = datetime.now()
         for row in rows:
-            user_id, username, plan, payment_id, start_date, duration_days, status = row
-            username_display = f"@{username}" if username else f"@{user_id}"
+            user_id, username, plan, payment_id, start_date, duration_days, status, config = row
+            username_display = f"@{username}" if username else f"{user_id}"
             start_date = start_date if start_date else current_time
             duration_days = duration_days if duration_days else 30
             remaining_days = 0
+            end_date = start_date + timedelta(days=duration_days)
+            
             if status == "active":
-                end_date = start_date + timedelta(days=duration_days)
                 remaining_days = max(0, (end_date - current_time).days)
-            response += f"کاربر: {username_display}\n"
-            response += f"اشتراک: {plan}\n"
-            response += f"کد خرید: #{payment_id}\n"
-            response += f"وضعیت: {'فعال' if status == 'active' else 'غیرفعال'}\n"
-            response += f"زمان باقی‌مانده: {remaining_days} روز\n"
-            response += "--------------------\n"
+            
+            config_status = "✅ ارسال شده" if config else "⏳ در انتظار"
+            
+            response += f"👤 کاربر: {username_display}\n"
+            response += f"📌 اشتراک: {plan}\n"
+            response += f"🆔 کد خرید: #{payment_id}\n"
+            response += f"📊 وضعیت: {'✅ فعال' if status == 'active' else '⏳ در انتظار' if status == 'pending' else '❌ غیرفعال'}\n"
+            response += f"🔐 کانفیگ: {config_status}\n"
+            if status == "active":
+                response += f"⏳ زمان باقی‌مانده: {remaining_days} روز\n"
+                response += f"📅 تاریخ شروع: {start_date.strftime('%Y-%m-%d')}\n"
+                response += f"📅 تاریخ انقضا: {end_date.strftime('%Y-%m-%d')}\n"
+            response += "--------------------\n\n"
         
         await send_long_message(update.effective_user.id, response, context)
     except Exception as e:
@@ -1175,6 +1263,11 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     elif state and state.startswith("awaiting_coupon_percent_") and user_id == ADMIN_ID:
         await handle_coupon_percent(update, context, user_id, state, text)
+        return
+    
+    # هندلر جدید برای دریافت ایدی کاربر در کوپن یک نفر
+    elif state and state.startswith("awaiting_coupon_single_user_") and user_id == ADMIN_ID:
+        await handle_coupon_single_user(update, context, user_id, state, text)
         return
 
     # پردازش کد تخفیف توسط کاربر عادی
@@ -1360,39 +1453,12 @@ async def handle_coupon_recipient(update, context, user_id, state, text):
         return
         
     elif text == "👤 برای یک نفر":
-        target_user_id = 6056483071
-        user = await db_execute(
-            "SELECT user_id, is_agent FROM users WHERE user_id = %s",
-            (target_user_id,), fetchone=True
+        # تغییر: دریافت ایدی عددی از ادمین
+        user_states[user_id] = f"awaiting_coupon_single_user_{coupon_code}_{discount_percent}"
+        await update.message.reply_text(
+            "🆔 لطفا ایدی عددی کاربر مورد نظر را وارد کنید:",
+            reply_markup=get_back_keyboard()
         )
-        if user:
-            _, is_agent = user
-            if is_agent:
-                await update.message.reply_text(
-                    "⚠️ این کاربر نماینده است و نمی‌تواند کد تخفیف دریافت کند.",
-                    reply_markup=get_main_keyboard()
-                )
-                user_states.pop(user_id, None)
-                return
-                
-            await create_coupon(coupon_code, discount_percent, target_user_id)
-            await context.bot.send_message(
-                chat_id=target_user_id,
-                text=f"🎉 کد تخفیف `{coupon_code}` با {discount_percent}% تخفیف برای شما!\n⏳ این کد فقط تا ۳ روز اعتبار دارد.\nفقط یک بار قابل استفاده است.",
-                parse_mode="Markdown"
-            )
-            await update.message.reply_text(
-                f"✅ کد تخفیف `{coupon_code}` برای کاربر با ID {target_user_id} ارسال شد.",
-                reply_markup=get_main_keyboard(),
-                parse_mode="Markdown"
-            )
-            user_states.pop(user_id, None)
-        else:
-            await update.message.reply_text(
-                f"⚠️ کاربری با ID {target_user_id} یافت نشد.",
-                reply_markup=get_main_keyboard()
-            )
-            user_states.pop(user_id, None)
         return
         
     elif text == "🎯 درصد خاصی از کاربران":
@@ -1403,6 +1469,75 @@ async def handle_coupon_recipient(update, context, user_id, state, text):
     else:
         await update.message.reply_text("⚠️ لطفا یکی از گزینه‌های بالا را انتخاب کنید.", reply_markup=get_coupon_recipient_keyboard())
         return
+
+async def handle_coupon_single_user(update, context, user_id, state, text):
+    """پردازش ارسال کد تخفیف برای یک کاربر خاص"""
+    parts = state.split("_")
+    coupon_code = parts[4]
+    discount_percent = int(parts[5])
+    
+    try:
+        target_user_id = int(text)
+        
+        # بررسی وجود کاربر
+        user = await db_execute(
+            "SELECT user_id, is_agent FROM users WHERE user_id = %s",
+            (target_user_id,), fetchone=True
+        )
+        
+        if not user:
+            await update.message.reply_text(
+                "⚠️ کاربری با این ایدی یافت نشد. لطفا ایدی معتبر وارد کنید:",
+                reply_markup=get_back_keyboard()
+            )
+            return
+            
+        _, is_agent = user
+        
+        if is_agent:
+            await update.message.reply_text(
+                "⚠️ این کاربر نماینده است و نمی‌تواند کد تخفیف دریافت کند. لطفا کاربر دیگری را وارد کنید:",
+                reply_markup=get_back_keyboard()
+            )
+            return
+        
+        # ایجاد و ارسال کد تخفیف
+        await create_coupon(coupon_code, discount_percent, target_user_id)
+        
+        try:
+            await context.bot.send_message(
+                chat_id=target_user_id,
+                text=f"🎉 کد تخفیف `{coupon_code}` با {discount_percent}% تخفیف برای شما!\n⏳ این کد فقط تا ۳ روز اعتبار دارد.\nفقط یک بار قابل استفاده است.",
+                parse_mode="Markdown"
+            )
+            
+            await update.message.reply_text(
+                f"✅ کد تخفیف `{coupon_code}` برای کاربر با ID {target_user_id} ارسال شد.",
+                reply_markup=get_main_keyboard(),
+                parse_mode="Markdown"
+            )
+            
+        except Exception as e:
+            logging.error(f"Error sending coupon to user_id {target_user_id}: {e}")
+            await update.message.reply_text(
+                f"⚠️ کد تخفیف ایجاد شد اما ارسال به کاربر ناموفق بود. کاربر ممکن است ربات را مسدود کرده باشد.",
+                reply_markup=get_main_keyboard()
+            )
+        
+        user_states.pop(user_id, None)
+        
+    except ValueError:
+        await update.message.reply_text(
+            "⚠️ لطفا یک ایدی عددی معتبر وارد کنید:",
+            reply_markup=get_back_keyboard()
+        )
+    except Exception as e:
+        logging.error(f"Error in handle_coupon_single_user: {e}")
+        await update.message.reply_text(
+            "⚠️ خطا در پردازش درخواست.",
+            reply_markup=get_main_keyboard()
+        )
+        user_states.pop(user_id, None)
 
 async def handle_coupon_percent(update, context, user_id, state, text):
     """پردازش درصد کاربران برای کد تخفیف"""
@@ -1875,7 +2010,7 @@ async def handle_normal_commands(update, context, user_id, text):
             success = await remove_user_from_db(target_user_id)
             if success:
                 await update.message.reply_text(
-                    f"✅ کاربر با ایدی {target_user_id} به طور کامل از دیتابی حذف شد.",
+                    f"✅ کاربر با ایدی {target_user_id} به طور کامل از دیتابیس حذف شد.",
                     reply_markup=get_main_keyboard()
                 )
             else:
@@ -1962,7 +2097,7 @@ async def handle_payment_method(update, context, user_id, text):
                     ])
                     await context.bot.send_message(
                         chat_id=ADMIN_ID,
-                        text=f"✅ پرداخت برای اشتراک ({plan}) تایید شد.",
+                        text=f"✅ پرداخت برای اشتراک ({plan}) تایید شد.\n\nکد خرید: #{payment_id}",
                         reply_markup=config_keyboard
                     )
                     user_states.pop(user_id, None)
@@ -2000,7 +2135,7 @@ async def show_user_subscriptions(update, context, user_id):
                 response += f"🔹 اشتراک #{sub['id']}\n"
                 response += f"📌 پلن: {sub['plan']}\n"
                 response += f"🆔 کد خرید: #{sub['payment_id']}\n"
-                response += f"📊 وضعیت: {'✅ فعال' if sub['status'] == 'active' else '⏳ در انتظار'}\n"
+                response += f"📊 وضعیت: {'✅ فعال' if sub['status'] == 'active' else '⏳ در انتظار' if sub['status'] == 'pending' else '❌ غیرفعال'}\n"
                 
                 if sub['status'] == "active":
                     remaining_days = max(0, (sub['end_date'] - current_time).days)
@@ -2291,6 +2426,20 @@ async def telegram_webhook(request: Request):
         logging.error(f"Error in webhook: {e}")
         return {"ok": False, "error": str(e)}
 
+# ---------- تنظیم Job Queue برای بررسی دوره‌ای اشتراک‌های منقضی شده ----------
+async def setup_jobs():
+    """راه‌اندازی تسک‌های دوره‌ای"""
+    try:
+        job_queue = application.job_queue
+        if job_queue:
+            # اجرا هر ۶ ساعت (21600 ثانیه)
+            job_queue.run_repeating(check_expired_subscriptions, interval=21600, first=10)
+            logging.info("✅ Expired subscriptions check job scheduled (every 6 hours)")
+        else:
+            logging.warning("⚠️ Job queue not available")
+    except Exception as e:
+        logging.error(f"Error setting up jobs: {e}")
+
 # ---------- lifecycle events ----------
 @app.on_event("startup")
 async def on_startup():
@@ -2305,6 +2454,9 @@ async def on_startup():
         # شروع application
         await application.initialize()
         await application.start()
+        
+        # تنظیم Job Queue
+        await setup_jobs()
         
         # تنظیم وب‌هوک
         await application.bot.set_webhook(url=WEBHOOK_URL)
@@ -2321,13 +2473,10 @@ async def on_startup():
                      f"⏰ زمان: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
                      f"🌐 وب‌هوک: {RENDER_BASE_URL}\n\n"
                      "🆕 تغییرات اعمال شده:\n"
-                     "1️⃣ حذف بخش کانفیگ‌های رایگان مردم\n"
-                     "2️⃣ بازگشت دکمه‌های مدیریتی در /user_info\n"
-                     "3️⃣ به‌روزرسانی قیمت‌ها به جدیدترین نسخه\n"
-                     "4️⃣ به‌روزرسانی متن درخواست نمایندگی\n"
-                     "5️⃣ رفع خطای UnboundLocalError\n"
-                     "6️⃣ رفع مشکل عدم نمایش دکمه ارسال کانفیگ\n"
-                     "7️⃣ رفع خطای AttributeError: 'NoneType' object has no attribute 'id'"
+                     "1️⃣ رفع مشکل نمایش اشتراک‌ها در دیباگ\n"
+                     "2️⃣ اضافه شدن سیستم اطلاع‌رسانی انقضای اشتراک (هر ۶ ساعت)\n"
+                     "3️⃣ اصلاح بخش کوپن برای یک نفر (دریافت ایدی دلخواه)\n"
+                     "4️⃣ به‌روزرسانی نمایش وضعیت کانفیگ در دیباگ"
             )
         except Exception as e:
             logging.error(f"Error sending startup message to admin: {e}")
